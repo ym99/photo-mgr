@@ -1,8 +1,7 @@
 /library/
-/_review/
-/_ingested/
-/_inbox/
-/logs/
+/_must-decide/
+/_must-provide/
+/_safe-to-delete/
 
 /exiftool.exe
 /exiftool_files/

@@ -12,7 +12,9 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $Script:Schema       = 1
-$Script:ManifestName = 'catalog.jsonl'
+$Script:ManifestName = '.catalog.jsonl'
+$Script:TwinMarker   = '--library--'
+$Script:TwinMaxLen   = 180
 $Script:Utf8NoBom    = [System.Text.UTF8Encoding]::new($false)
 $Script:MinYear      = 1990
 $Script:ExifTool     = $null
@@ -28,20 +30,44 @@ $Script:JunkNames      = @('thumbs.db', 'desktop.ini', '.ds_store')
 function Get-SotPaths {
     param([string]$RootPath)
     $full = [System.IO.Path]::GetFullPath($RootPath)
+    $decide  = Join-Path $full '_must-decide'
+    $provide = Join-Path $full '_must-provide'
+    $safe    = Join-Path $full '_safe-to-delete'
     [pscustomobject]@{
-        Root     = $full
-        Library  = Join-Path $full 'library'
-        Undated  = Join-Path $full (Join-Path '_review' 'undated')
-        Review   = Join-Path $full '_review'
-        Ingested = Join-Path $full '_ingested'
-        Logs     = Join-Path $full 'logs'
+        Root          = $full
+        Library       = Join-Path $full 'library'
+        MustDecide    = $decide
+        MustProvide   = $provide
+        SafeToDelete  = $safe
+        Keep          = Join-Path $decide 'keep'
+        PartialCopy   = Join-Path $decide 'partial-copy--group-has-new-files'
+        SuspectCopy   = Join-Path $decide 'suspected-copy--same-time-and-camera-but-diff-hash'
+        DateMissing   = Join-Path $provide 'date-missing--no-exif-or-filename'
+        CompleteCopy  = Join-Path $safe 'complete-copy--hash-match'
+        Damaged       = Join-Path $safe 'damaged--zero-bytes'
+        NonMedia      = Join-Path $safe 'non-media'
+        OrphanSidecar = Join-Path $safe 'orphan-sidecar'
     }
 }
 
-function New-SotLayout {
+function Assert-SotRoot {
     param($Paths)
-    foreach ($dir in @($Paths.Library, $Paths.Undated, $Paths.Review, $Paths.Ingested, $Paths.Logs)) {
-        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
+    if (-not (Test-Path -LiteralPath $Paths.Library -PathType Container)) {
+        Write-Host "library\ not found under $($Paths.Root)"
+        Write-Host '  wrong -Root? (default is the script folder)'
+        Write-Host "  for a brand-new SoT create it manually: mkdir `"$($Paths.Library)`""
+        throw 'library folder not found'
+    }
+    $lp = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' -Name LongPathsEnabled -ErrorAction SilentlyContinue
+    if (-not $lp -or $lp.LongPathsEnabled -ne 1) {
+        Write-Warning 'LongPathsEnabled is off; paths over 260 chars will fail'
+    }
+}
+
+function Confirm-KeepFolder {
+    param($Paths)
+    if ((Test-Path -LiteralPath $Paths.MustDecide) -and -not (Test-Path -LiteralPath $Paths.Keep)) {
+        New-Item -ItemType Directory -Path $Paths.Keep -Force | Out-Null
     }
 }
 
@@ -145,6 +171,11 @@ function Get-FileSha256 {
     'sha256:' + (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
+function Set-FileReadOnly {
+    param([string]$Path, [bool]$Value)
+    (Get-Item -LiteralPath $Path -Force).IsReadOnly = $Value
+}
+
 function Resolve-ExifTool {
     $local = Join-Path $PSScriptRoot 'exiftool.exe'
     if (Test-Path -LiteralPath $local) { return $local }
@@ -180,11 +211,14 @@ function Get-MediaMetadata {
         [System.IO.File]::WriteAllLines($argFile, [string[]]($Script:ExifToolArgs + $batch), $Script:Utf8NoBom)
         try {
             $raw = & $Script:ExifTool -@ $argFile 2>$null
-            if ($raw) {
-                foreach ($entry in ($raw -join "`n" | ConvertFrom-Json)) {
-                    $key = [System.IO.Path]::GetFullPath($entry.SourceFile).ToLowerInvariant()
-                    $map[$key] = $entry
-                }
+            $parsed = $null
+            if ($raw) { $parsed = $raw -join "`n" | ConvertFrom-Json }
+            if (-not $parsed) {
+                throw "exiftool returned no metadata for a batch of $($batch.Count) files starting at $($batch[0])"
+            }
+            foreach ($entry in $parsed) {
+                $key = [System.IO.Path]::GetFullPath($entry.SourceFile).ToLowerInvariant()
+                $map[$key] = $entry
             }
         }
         finally { Remove-Item -LiteralPath $argFile -ErrorAction SilentlyContinue }
@@ -351,7 +385,7 @@ function New-CatalogIndex {
         Records = 0
     }
     if (Test-Path -LiteralPath $Library) {
-        foreach ($manifest in @(Get-ChildItem -LiteralPath $Library -Recurse -Filter $Script:ManifestName -File)) {
+        foreach ($manifest in @(Get-ChildItem -LiteralPath $Library -Recurse -Filter $Script:ManifestName -File -Force)) {
             $folder = $manifest.DirectoryName
             foreach ($record in (Read-Manifest $folder)) {
                 Add-RecordToIndex $index $record $folder
@@ -393,9 +427,9 @@ function Move-FileSafe {
 }
 
 function Move-ToBucket {
-    param([string]$File, [string]$InboxRoot, [string]$BucketDir, [string]$SubDir)
-    $rel = [System.IO.Path]::GetRelativePath($InboxRoot, $File)
-    Move-FileSafe -Source $File -Dest (Join-Path (Join-Path $BucketDir $SubDir) $rel)
+    param([string]$File, [string]$SourceRoot, [string]$BucketDir)
+    $rel = [System.IO.Path]::GetRelativePath($SourceRoot, $File)
+    Move-FileSafe -Source $File -Dest (Join-Path $BucketDir $rel)
 }
 
 function Remove-EmptyInboxDirs {
@@ -416,7 +450,7 @@ function Remove-EmptyInboxDirs {
             }
         }
     }
-    if ($removed -gt 0) { Write-Host "Removed $removed empty inbox folder(s)" }
+    if ($removed -gt 0) { Write-Host "Removed $removed empty folder(s)" }
 }
 
 function Resolve-GroupBaseName {
@@ -432,138 +466,158 @@ function Resolve-GroupBaseName {
     throw "No free name for $BaseName in $DestDir"
 }
 
-function Write-IngestLog {
-    param($Writer, [string]$Batch, [string]$Action, [string]$File, $Dest, $Reason)
-    $entry = [ordered]@{
-        ts     = Get-UtcNowStamp
-        batch  = $Batch
-        action = $Action
-        file   = $File
-        dest   = $Dest
-        reason = $Reason
+function Copy-LibraryTwin {
+    param([string]$SuspectFinalPath, [string]$LibraryFile)
+    if (-not (Test-Path -LiteralPath $LibraryFile)) { return }
+    $dir = Split-Path -Parent $SuspectFinalPath
+    $suspectLeaf = Split-Path -Leaf $SuspectFinalPath
+    $libLeaf = Split-Path -Leaf $LibraryFile
+    $ext = [System.IO.Path]::GetExtension($libLeaf)
+    $name = $suspectLeaf + $Script:TwinMarker + $libLeaf
+    if ($name.Length -gt $Script:TwinMaxLen) {
+        $tailBudget = $Script:TwinMaxLen - $suspectLeaf.Length - $Script:TwinMarker.Length - $ext.Length
+        $libBase = [System.IO.Path]::GetFileNameWithoutExtension($libLeaf)
+        if ($tailBudget -lt 1) { $name = $suspectLeaf + $Script:TwinMarker + 'x' + $ext }
+        else { $name = $suspectLeaf + $Script:TwinMarker + $libBase.Substring(0, [Math]::Min($libBase.Length, $tailBudget)) + $ext }
     }
-    if ($null -ne $Writer) { $Writer.WriteLine((ConvertTo-JsonLine $entry)) }
+    $dest = Join-Path $dir $name
+    if (Test-Path -LiteralPath $dest) { return }
+    Copy-Item -LiteralPath $LibraryFile -Destination $dest
+    Set-FileReadOnly $dest $false
 }
 
-function Import-Batch {
-    [CmdletBinding(SupportsShouldProcess)]
-    param(
-        [string]$Inbox,
-        [string]$Root = $PSScriptRoot
-    )
-
-    if (-not $Inbox) { Write-Usage 'ingest'; throw 'ingest requires -Inbox' }
-    $Script:ExifTool = Resolve-ExifTool
-    $Paths = Get-SotPaths $Root
-    New-SotLayout $Paths
-
-    $inboxFull = [System.IO.Path]::GetFullPath($Inbox)
-    if (-not (Test-Path -LiteralPath $inboxFull -PathType Container)) { throw "Inbox not found: $inboxFull" }
-    if ([System.IO.Path]::GetPathRoot($inboxFull) -ne [System.IO.Path]::GetPathRoot($Paths.Root)) {
-        throw 'Inbox must be on the same volume as the SoT root (moves must be atomic)'
+function Get-LibraryGroupFiles {
+    param([string]$LibraryFilePath)
+    $folder = Split-Path -Parent $LibraryFilePath
+    $name = Split-Path -Leaf $LibraryFilePath
+    $records = Read-Manifest $folder
+    $rec = $records | Where-Object { [string]$_.name -eq $name } | Select-Object -First 1
+    if (-not $rec) {
+        return , @([pscustomobject]@{
+            Path = $LibraryFilePath; Role = 'primary'; Ext = [System.IO.Path]::GetExtension($name)
+        })
     }
-
-    $batch = '{0}-{1}' -f (Split-Path -Leaf $inboxFull), [DateTime]::Now.ToString('yyyyMMdd-HHmmss')
-    $dryRun = [bool]$WhatIfPreference
-
-    $all = @(Get-ChildItem -LiteralPath $inboxFull -Recurse -File | Where-Object { $_.Name -ne $Script:ManifestName })
-    $files = @($all | Where-Object {
-        -not ($Script:JunkNames -contains $_.Name.ToLowerInvariant()) -and -not $_.Name.StartsWith('._')
-    })
-    $junkCount = $all.Count - $files.Count
-    if ($files.Count -eq 0) { Write-Host 'Nothing to ingest.'; return }
-
-    Write-Host "Batch $batch : $($files.Count) files (skipping $junkCount junk)"
-    $meta = Get-MediaMetadata @($files.FullName)
-    $index = New-CatalogIndex $Paths.Library
-    Write-Host "Index loaded: $($index.Records) records"
-
-    $log = $null
-    if (-not $dryRun) {
-        $log = [System.IO.StreamWriter]::new((Join-Path $Paths.Logs "ingest-$batch.jsonl"), $true, $Script:Utf8NoBom)
-    }
-    $stats = @{ ingested = 0; duplicate = 0; review = 0; undated = 0; error = 0 }
-
-    try {
-        foreach ($group in (Get-AssetGroups $files)) {
-            try {
-                Invoke-GroupIngest -Paths $Paths -Group $group -Meta $meta -Index $index `
-                    -InboxRoot $inboxFull -Batch $batch -Log $log -Stats $stats
-            }
-            catch {
-                $stats.error++
-                Write-Warning "Failed on $($group.Key): $_"
-                Write-IngestLog $log $batch 'error' $group.Key $null "$_"
-            }
+    $primaryName = if ($rec.primary) { [string]$rec.primary } else { [string]$rec.name }
+    $group = @($records | Where-Object { [string]$_.name -eq $primaryName -or [string]$_.primary -eq $primaryName })
+    , @($group | ForEach-Object {
+        [pscustomobject]@{
+            Path = Join-Path $folder ([string]$_.name)
+            Role = [string]$_.role
+            Ext  = [System.IO.Path]::GetExtension([string]$_.name)
         }
+    })
+}
+
+function New-IngestStats {
+    @{
+        'ingested'        = 0
+        'complete-copy'   = 0
+        'partial-copy'    = 0
+        'suspected-copy'  = 0
+        'date-missing'    = 0
+        'damaged'         = 0
+        'orphan-sidecar'  = 0
+        'non-media'       = 0
     }
-    finally { if ($log) { $log.Dispose() } }
+}
 
-    Remove-EmptyInboxDirs -InboxRoot $inboxFull
-
+function Write-IngestSummary {
+    param($Stats)
+    $parts = foreach ($key in @('ingested', 'complete-copy', 'partial-copy', 'suspected-copy', 'date-missing', 'damaged', 'orphan-sidecar', 'non-media')) {
+        if ($Stats[$key] -gt 0) { "$key $($Stats[$key])" }
+    }
+    if (-not $parts) { $parts = @('nothing processed') }
     Write-Host ''
-    Write-Host ("Ingested {0}  Duplicate {1}  Review {2}  Undated {3}  Errors {4}" -f `
-        $stats.ingested, $stats.duplicate, $stats.review, $stats.undated, $stats.error)
-    $undatedCount = @(Get-ChildItem -LiteralPath $Paths.Undated -File -ErrorAction SilentlyContinue).Count
-    if ($undatedCount -gt 0) { Write-Host "_review\undated now holds $undatedCount files awaiting manual dating" }
+    Write-Host ("Groups: " + ($parts -join '  '))
+}
+
+function Get-BucketFileCount {
+    param([string]$Dir, [switch]$Recurse)
+    if (-not (Test-Path -LiteralPath $Dir)) { return 0 }
+    @(Get-ChildItem -LiteralPath $Dir -File -Recurse:$Recurse |
+        Where-Object { $_.Name -notlike "*$($Script:TwinMarker)*" -and $_.Name -ne $Script:ManifestName }).Count
+}
+
+function Write-PendingSummary {
+    param($Paths)
+    $partial = Get-BucketFileCount $Paths.PartialCopy
+    $suspect = Get-BucketFileCount $Paths.SuspectCopy
+    $keep = Get-BucketFileCount $Paths.Keep -Recurse
+    $dates = Get-BucketFileCount $Paths.DateMissing -Recurse
+    if ($partial -gt 0 -or $suspect -gt 0) {
+        Write-Host "_must-decide pending: $partial partial-copy, $suspect suspected-copy"
+    }
+    if ($keep -gt 0)  { Write-Host "_must-decide\keep holds $keep file(s) awaiting 'decided'" }
+    if ($dates -gt 0) { Write-Host "_must-provide holds $dates file(s) awaiting dates ('provided' after dating)" }
 }
 
 function Invoke-GroupIngest {
     [CmdletBinding(SupportsShouldProcess)]
-    param($Paths, $Group, $Meta, $Index, [string]$InboxRoot, [string]$Batch, $Log, $Stats)
+    param(
+        $Paths, $Group, $Meta, $Index, [string]$InboxRoot, $Stats,
+        [switch]$SkipExifTier, [switch]$ForceManualDate
+    )
 
     $metaOf = { param($f) $Meta[$f.FullName.ToLowerInvariant()] }
 
     if ($null -eq $Group.Primary) {
         foreach ($m in $Group.Members) {
-            $dest = Move-ToBucket $m.FullName $InboxRoot $Paths.Review 'no-media-primary'
-            Write-IngestLog $Log $Batch 'review' $m.FullName $dest 'no-media-primary'
+            Move-FileSafe -Source $m.FullName -Dest (Join-Path $Paths.OrphanSidecar $m.Name) | Out-Null
         }
-        $Stats.review++
+        $Stats['orphan-sidecar']++
         return
     }
 
     if (@($Group.Members | Where-Object Length -eq 0).Count -gt 0) {
         foreach ($m in $Group.Members) {
-            $dest = Move-ToBucket $m.FullName $InboxRoot $Paths.Review 'zero-byte'
-            Write-IngestLog $Log $Batch 'review' $m.FullName $dest 'zero-byte'
+            Move-FileSafe -Source $m.FullName -Dest (Join-Path $Paths.Damaged $m.Name) | Out-Null
         }
-        $Stats.review++
+        $Stats['damaged']++
         return
     }
 
     $extras = @($Group.Members | Where-Object { (Get-ExtInfo $_.Extension).Kind -eq 'other' })
     foreach ($m in $extras) {
-        $dest = Move-ToBucket $m.FullName $InboxRoot $Paths.Review 'non-media'
-        Write-IngestLog $Log $Batch 'review' $m.FullName $dest 'non-media'
+        Move-FileSafe -Source $m.FullName -Dest (Join-Path $Paths.NonMedia $m.Name) | Out-Null
+        $Stats['non-media']++
     }
     $members = @($Group.Members | Where-Object { (Get-ExtInfo $_.Extension).Kind -ne 'other' })
+    if ($members.Count -eq 0) { return }
 
     $hashes = @{}
     foreach ($m in $members) { $hashes[$m.FullName] = Get-FileSha256 $m.FullName }
 
     $mediaMembers = @($members | Where-Object { (Get-ExtInfo $_.Extension).Kind -eq 'media' })
+    $matchTarget = @{}
     $newOnes = @()
     foreach ($m in $mediaMembers) {
-        $img = Get-ImageDataHash (& $metaOf $m)
-        $isDup = $Index.ByHash.ContainsKey($hashes[$m.FullName]) -or ($img -and $Index.ByImage.ContainsKey($img))
-        if (-not $isDup) { $newOnes += $m }
+        $hit = $null
+        if ($Index.ByHash.ContainsKey($hashes[$m.FullName])) { $hit = $Index.ByHash[$hashes[$m.FullName]] }
+        else {
+            $img = Get-ImageDataHash (& $metaOf $m)
+            if ($img -and $Index.ByImage.ContainsKey($img)) { $hit = $Index.ByImage[$img] }
+        }
+        $matchTarget[$m.FullName] = $hit
+        if ($null -eq $hit) { $newOnes += $m }
     }
 
     if ($newOnes.Count -eq 0) {
         foreach ($m in $members) {
-            $dest = Move-ToBucket $m.FullName $InboxRoot $Paths.Ingested $Batch
-            Write-IngestLog $Log $Batch 'duplicate' $m.FullName $dest 'hash-match'
+            Move-FileSafe -Source $m.FullName -Dest (Join-Path $Paths.CompleteCopy $m.Name) | Out-Null
         }
-        $Stats.duplicate++
+        $Stats['complete-copy']++
         return
     }
+
     if ($newOnes.Count -lt $mediaMembers.Count) {
         foreach ($m in $members) {
-            $dest = Move-ToBucket $m.FullName $InboxRoot $Paths.Review 'partial-duplicate'
-            Write-IngestLog $Log $Batch 'review' $m.FullName $dest 'partial-duplicate'
+            $moved = Move-FileSafe -Source $m.FullName -Dest (Join-Path $Paths.PartialCopy $m.Name)
+            if ($moved -and $matchTarget.ContainsKey($m.FullName) -and $matchTarget[$m.FullName]) {
+                Copy-LibraryTwin $moved $matchTarget[$m.FullName]
+            }
         }
-        $Stats.review++
+        Confirm-KeepFolder $Paths
+        $Stats['partial-copy']++
         return
     }
 
@@ -573,24 +627,40 @@ function Invoke-GroupIngest {
         if ($resolved) { break }
     }
 
-    if ($resolved) {
+    if ($null -eq $resolved) {
+        foreach ($m in $members) {
+            Move-ToBucket $m.FullName $InboxRoot $Paths.DateMissing | Out-Null
+        }
+        $Stats['date-missing']++
+        return
+    }
+
+    if (-not $SkipExifTier) {
         $exifKey = Get-MetaExifKey $resolved (& $metaOf $Group.Primary)
         if ($exifKey -and $Index.ByExif.ContainsKey($exifKey)) {
+            $matched = $Index.ByExif[$exifKey]
+            $libGroup = Get-LibraryGroupFiles $matched
+            $libPrimary = $libGroup | Where-Object { $_.Role -eq 'primary' } | Select-Object -First 1
+            if (-not $libPrimary) { $libPrimary = $libGroup | Select-Object -First 1 }
             foreach ($m in $members) {
-                $dest = Move-ToBucket $m.FullName $InboxRoot $Paths.Review 'exif-key-match'
-                Write-IngestLog $Log $Batch 'review' $m.FullName $dest "exif-key-match: $($Index.ByExif[$exifKey])"
+                $moved = Move-FileSafe -Source $m.FullName -Dest (Join-Path $Paths.SuspectCopy $m.Name)
+                if ($null -eq $moved) { continue }
+                $info = Get-ExtInfo $m.Extension
+                $isPrimary = $m.FullName -eq $Group.Primary.FullName
+                $counterpart = $null
+                if ($isPrimary) { $counterpart = $libPrimary }
+                elseif ($info.Kind -eq 'sidecar') {
+                    $counterpart = $libGroup | Where-Object { $_.Role -eq 'sidecar' -and $_.Ext -ieq $m.Extension } | Select-Object -First 1
+                }
+                else {
+                    $counterpart = $libGroup | Where-Object { $_.Role -eq 'companion' -and $_.Ext -ieq $m.Extension } | Select-Object -First 1
+                }
+                if ($counterpart) { Copy-LibraryTwin $moved $counterpart.Path }
             }
-            $Stats.review++
+            Confirm-KeepFolder $Paths
+            $Stats['suspected-copy']++
             return
         }
-    }
-    else {
-        foreach ($m in $members) {
-            $dest = Move-FileSafe -Source $m.FullName -Dest (Join-Path $Paths.Undated $m.Name)
-            Write-IngestLog $Log $Batch 'undated' $m.FullName $dest 'no-date'
-        }
-        $Stats.undated++
-        return
     }
 
     $destDir = Join-Path $Paths.Library (Join-Path ([string]$resolved.Date.Year) $resolved.Date.ToString('yyyy-MM'))
@@ -603,18 +673,19 @@ function Invoke-GroupIngest {
     $base = Resolve-GroupBaseName $destDir $base $members
     $primaryTargetName = $base + $Group.Primary.Extension
     $now = Get-UtcNowStamp
+    $dateSource = if ($ForceManualDate) { 'manual' } else { $resolved.Source }
 
     foreach ($m in $members) {
         $isSidecar = (Get-ExtInfo $m.Extension).Kind -eq 'sidecar'
         $isPrimary = $m.FullName -eq $Group.Primary.FullName
-        $targetName = $base + $m.Extension
         $mMeta = & $metaOf $m
         $size = $m.Length
         $origName = ConvertTo-Nfc $m.Name
 
-        $moved = Move-FileSafe -Source $m.FullName -Dest (Join-Path $destDir $targetName)
+        $moved = Move-FileSafe -Source $m.FullName -Dest (Join-Path $destDir ($base + $m.Extension))
         if ($null -eq $moved) { continue }
         [System.IO.File]::SetLastWriteTime($moved, $resolved.Date)
+        Set-FileReadOnly $moved $true
 
         $duration = Get-Tag $mMeta @('Duration')
         if ($null -ne $duration) { $duration = [double]$duration }
@@ -630,7 +701,7 @@ function Invoke-GroupIngest {
             -Size $size `
             -HashFull $hashes[$m.FullName] `
             -HashImage ($(if ($isSidecar) { $null } else { Get-ImageDataHash $mMeta })) `
-            -DateTaken $resolved.Date -DateSource $resolved.Source -TzOffset $resolved.Tz `
+            -DateTaken $resolved.Date -DateSource $dateSource -TzOffset $resolved.Tz `
             -Width ($(if ($isSidecar) { $null } else { $width })) `
             -Height ($(if ($isSidecar) { $null } else { $height })) `
             -Duration ($(if ($isSidecar) { $null } else { $duration })) `
@@ -641,9 +712,131 @@ function Invoke-GroupIngest {
 
         Add-ManifestRecord $destDir $record
         Add-RecordToIndex $Index $record $destDir
-        Write-IngestLog $Log $Batch 'ingested' $m.FullName $moved $resolved.Source
     }
-    $Stats.ingested++
+    $Stats['ingested']++
+}
+
+function Get-IngestibleFiles {
+    param([string]$Dir)
+    if (-not (Test-Path -LiteralPath $Dir)) { return , @() }
+    , @(Get-ChildItem -LiteralPath $Dir -Recurse -File | Where-Object {
+        $_.Name -ne $Script:ManifestName -and
+        -not ($Script:JunkNames -contains $_.Name.ToLowerInvariant()) -and
+        -not $_.Name.StartsWith('._') -and
+        $_.Name -notlike "*$($Script:TwinMarker)*"
+    })
+}
+
+function Import-Batch {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [string]$Inbox,
+        [string]$Root = $PSScriptRoot
+    )
+
+    if (-not $Inbox) { Write-Usage 'ingest'; throw 'ingest requires -Inbox' }
+    $Script:ExifTool = Resolve-ExifTool
+    $Paths = Get-SotPaths $Root
+    Assert-SotRoot $Paths
+
+    $inboxFull = [System.IO.Path]::GetFullPath($Inbox)
+    if (-not (Test-Path -LiteralPath $inboxFull -PathType Container)) { throw "Inbox not found: $inboxFull" }
+    if ([System.IO.Path]::GetPathRoot($inboxFull) -ne [System.IO.Path]::GetPathRoot($Paths.Root)) {
+        throw 'Inbox must be on the same volume as the SoT root (moves must be atomic)'
+    }
+    foreach ($managed in @($Paths.Library, $Paths.MustDecide, $Paths.MustProvide, $Paths.SafeToDelete)) {
+        $prefix = $managed.TrimEnd('\') + '\'
+        if (($inboxFull.TrimEnd('\') + '\').StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Inbox cannot be inside the managed folder $managed"
+        }
+    }
+
+    $files = Get-IngestibleFiles $inboxFull
+    if ($files.Count -eq 0) { Write-Host 'Nothing to ingest.'; return }
+
+    Write-Host "Ingesting $($files.Count) files from $inboxFull"
+    $meta = Get-MediaMetadata @($files.FullName)
+    $index = New-CatalogIndex $Paths.Library
+    Write-Host "Index loaded: $($index.Records) records"
+
+    $stats = New-IngestStats
+    foreach ($group in (Get-AssetGroups $files)) {
+        Invoke-GroupIngest -Paths $Paths -Group $group -Meta $meta -Index $index `
+            -InboxRoot $inboxFull -Stats $stats
+    }
+
+    Remove-EmptyInboxDirs -InboxRoot $inboxFull
+    Write-IngestSummary $stats
+    Write-PendingSummary $Paths
+}
+
+function Import-Decisions {
+    [CmdletBinding(SupportsShouldProcess)]
+    param([string]$Root = $PSScriptRoot)
+
+    $Script:ExifTool = Resolve-ExifTool
+    $Paths = Get-SotPaths $Root
+    Assert-SotRoot $Paths
+
+    $files = Get-IngestibleFiles $Paths.Keep
+    if ($files.Count -eq 0) {
+        Write-Host 'keep is empty - no decisions to apply.'
+        Write-PendingSummary $Paths
+        return
+    }
+
+    Write-Host "Applying $($files.Count) decided files from $($Paths.Keep)"
+    $meta = Get-MediaMetadata @($files.FullName)
+    $index = New-CatalogIndex $Paths.Library
+    $stats = New-IngestStats
+    foreach ($group in (Get-AssetGroups $files)) {
+        Invoke-GroupIngest -Paths $Paths -Group $group -Meta $meta -Index $index `
+            -InboxRoot $Paths.Keep -Stats $stats -SkipExifTier
+    }
+
+    Write-IngestSummary $stats
+    Write-PendingSummary $Paths
+}
+
+function Import-Dates {
+    [CmdletBinding(SupportsShouldProcess)]
+    param([string]$Root = $PSScriptRoot)
+
+    $Script:ExifTool = Resolve-ExifTool
+    $Paths = Get-SotPaths $Root
+    Assert-SotRoot $Paths
+
+    $files = Get-IngestibleFiles $Paths.DateMissing
+    if ($files.Count -eq 0) {
+        Write-Host 'Nothing awaits a date.'
+        Write-PendingSummary $Paths
+        return
+    }
+
+    Write-Host "Checking $($files.Count) files in $($Paths.DateMissing)"
+    $meta = Get-MediaMetadata @($files.FullName)
+    $index = New-CatalogIndex $Paths.Library
+    $stats = New-IngestStats
+    $stillUndated = 0
+
+    foreach ($group in (Get-AssetGroups $files)) {
+        $resolved = $null
+        foreach ($m in @($group.Members | Where-Object { (Get-ExtInfo $_.Extension).Kind -eq 'media' })) {
+            $resolved = Resolve-DateTaken $meta[$m.FullName.ToLowerInvariant()] $m.Name
+            if ($resolved) { break }
+        }
+        if ($null -eq $resolved) {
+            $stillUndated += $group.Members.Count
+            continue
+        }
+        Invoke-GroupIngest -Paths $Paths -Group $group -Meta $meta -Index $index `
+            -InboxRoot $Paths.DateMissing -Stats $stats -ForceManualDate
+    }
+
+    Remove-EmptyInboxDirs -InboxRoot $Paths.DateMissing
+    Write-IngestSummary $stats
+    Write-Host "Still need a date: $stillUndated file(s)"
+    Write-PendingSummary $Paths
 }
 
 function Get-LibraryFolders {
@@ -663,6 +856,7 @@ function Test-Catalog {
     )
 
     $Paths = Get-SotPaths $Root
+    Assert-SotRoot $Paths
     $dryRun = [bool]$WhatIfPreference
     $now = Get-UtcNowStamp
     $findings = [System.Collections.Generic.List[object]]::new()
@@ -684,6 +878,9 @@ function Test-Catalog {
                 continue
             }
             $actual.Remove([string]$record.name)
+            if (-not $file.IsReadOnly) {
+                $findings.Add([pscustomobject]@{ issue = 'not-readonly'; folder = $folder; name = $record.name; detail = 'run update to restore' })
+            }
             if ($file.Length -ne $record.size) {
                 $issue = if ($file.Length -eq 0) { 'zeroed' } else { 'size-mismatch' }
                 $findings.Add([pscustomobject]@{ issue = $issue; folder = $folder; name = $record.name; detail = "expected $($record.size), found $($file.Length)" })
@@ -693,16 +890,7 @@ function Test-Catalog {
 
             $hash = Get-FileSha256 $file.FullName
             if ($hash -ne $record.hash_full) {
-                if ($record.role -eq 'sidecar') {
-                    $record.hash_full = $hash
-                    $record.size = $file.Length
-                    $record.last_verified = $now
-                    $changed = $true
-                    $findings.Add([pscustomobject]@{ issue = 'sidecar-updated'; folder = $folder; name = $record.name; detail = $null })
-                }
-                else {
-                    $findings.Add([pscustomobject]@{ issue = 'corrupt'; folder = $folder; name = $record.name; detail = "hash mismatch" })
-                }
+                $findings.Add([pscustomobject]@{ issue = 'corrupt'; folder = $folder; name = $record.name; detail = 'hash mismatch' })
             }
             else {
                 $record.last_verified = $now
@@ -721,15 +909,7 @@ function Test-Catalog {
     $mode = if ($Full) { 'full' } else { 'quick' }
     Write-Host "Verify ($mode): $checked records checked, $($bad.Count) problems, $($findings.Count) findings total"
     foreach ($f in $findings) { Write-Host ("  [{0}] {1}\{2} {3}" -f $f.issue, $f.folder, $f.name, $f.detail) }
-
-    if (-not $dryRun -and $findings.Count -gt 0) {
-        $logPath = Join-Path $Paths.Logs ('verify-{0}.jsonl' -f [DateTime]::Now.ToString('yyyyMMdd-HHmmss'))
-        [System.IO.File]::WriteAllLines($logPath, [string[]]@($findings | ForEach-Object { ConvertTo-JsonLine $_ }), $Script:Utf8NoBom)
-        Write-Host "Findings logged to $logPath"
-    }
-
-    $undatedCount = @(Get-ChildItem -LiteralPath $Paths.Undated -File -ErrorAction SilentlyContinue).Count
-    if ($undatedCount -gt 0) { Write-Host "_review\undated holds $undatedCount files awaiting manual dating" }
+    Write-PendingSummary $Paths
     $findings
 }
 
@@ -745,22 +925,34 @@ function Update-Catalog {
 
     $Script:ExifTool = Resolve-ExifTool
     $Paths = Get-SotPaths $Root
+    Assert-SotRoot $Paths
     $added = 0
     $skipped = 0
+    $rearmed = 0
 
     foreach ($folder in (Get-LibraryFolders $Paths)) {
         $records = Read-Manifest $folder
         $known = @{}
         foreach ($r in $records) { $known[[string]$r.name] = $r }
 
+        foreach ($r in $records) {
+            $p = Join-Path $folder ([string]$r.name)
+            if (-not (Test-Path -LiteralPath $p)) {
+                Write-Warning "Record without file (reset required to remove): $folder\$($r.name)"
+                continue
+            }
+            $item = Get-Item -LiteralPath $p
+            if (-not $item.IsReadOnly) {
+                if ($PSCmdlet.ShouldProcess($p, 'Restore read-only attribute')) {
+                    $item.IsReadOnly = $true
+                    $rearmed++
+                }
+            }
+        }
+
         $orphans = @(Get-ChildItem -LiteralPath $folder -File | Where-Object {
             $_.Name -ne $Script:ManifestName -and -not $known.ContainsKey((ConvertTo-Nfc $_.Name))
         })
-        foreach ($r in $records) {
-            if (-not (Test-Path -LiteralPath (Join-Path $folder ([string]$r.name)))) {
-                Write-Warning "Record without file (reset required to remove): $folder\$($r.name)"
-            }
-        }
         if ($orphans.Count -eq 0) { continue }
 
         $meta = Get-MediaMetadata @($orphans.FullName)
@@ -769,7 +961,7 @@ function Update-Catalog {
 
             $primaryName = $null
             $resolved = $null
-            if ($null -ne $Group.Primary) {
+            if ($null -ne $group.Primary) {
                 $primaryName = ConvertTo-Nfc $group.Primary.Name
                 foreach ($m in $mediaMembers) {
                     $resolved = Resolve-DateTaken $meta[$m.FullName.ToLowerInvariant()] $m.Name
@@ -834,12 +1026,13 @@ function Update-Catalog {
 
                 if ($PSCmdlet.ShouldProcess("$folder\$($m.Name)", 'Append catalog record')) {
                     Add-ManifestRecord $folder $record
+                    Set-FileReadOnly $m.FullName $true
                 }
                 $added++
             }
         }
     }
-    Write-Host "Update: $added records appended, $skipped files left uncataloged"
+    Write-Host "Update: $added records appended, $rearmed read-only attributes restored, $skipped files left uncataloged"
 }
 
 function Reset-Catalog {
@@ -852,6 +1045,7 @@ function Reset-Catalog {
 
     $Script:ExifTool = Resolve-ExifTool
     $Paths = Get-SotPaths $Root
+    Assert-SotRoot $Paths
     $folders = Get-LibraryFolders $Paths
     if ($Month -ne 'all') {
         if ($Month -notmatch '^\d{4}-\d{2}$') { Write-Usage 'reset'; throw "reset -Month expects 'yyyy-MM' or 'all'" }
@@ -965,6 +1159,7 @@ function Export-Catalog {
     )
 
     $Paths = Get-SotPaths $Root
+    Assert-SotRoot $Paths
     if (-not $Out) { Write-Usage 'export'; throw 'export requires -Out' }
     $allColumns = @('name', 'role', 'primary', 'size', 'hash_full', 'hash_imagedata',
         'date_taken', 'date_source', 'tz_offset', 'width', 'height', 'duration',
@@ -1008,29 +1203,14 @@ function Export-Catalog {
     Write-Host "Exported $count records to $Out"
 }
 
-function Initialize-Sot {
-    [CmdletBinding()]
-    param([string]$Root = $PSScriptRoot)
-
-    $Script:ExifTool = Resolve-ExifTool
-    $Paths = Get-SotPaths $Root
-    New-SotLayout $Paths
-    $version = & $Script:ExifTool -ver
-    Write-Host "SoT layout ready under $($Paths.Root)"
-    Write-Host "exiftool $version at $Script:ExifTool"
-    $lp = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' -Name LongPathsEnabled -ErrorAction SilentlyContinue
-    if (-not $lp -or $lp.LongPathsEnabled -ne 1) {
-        Write-Warning 'LongPathsEnabled is off; paths over 260 chars will fail'
-    }
-}
-
 $Script:UsageText = [ordered]@{
-    init   = 'init    [-Root <path>]'
-    ingest = 'ingest  -Inbox <folder> [-WhatIf] [-Root <path>]'
-    verify = 'verify  [-Full] [-WhatIf] [-Root <path>]'
-    update = 'update  [-WhatIf] [-Root <path>]'
-    reset  = 'reset   [-Month <yyyy-MM|all>] [-Force] [-WhatIf] [-Root <path>]'
-    export = 'export  -Out <file> [-As <Csv|Jsonl>] [-From <yyyy-MM>] [-To <yyyy-MM>] [-Role <primary|companion|sidecar>] [-Columns <a,b,c>] [-Root <path>]'
+    ingest   = 'ingest   -Inbox <folder> [-WhatIf] [-Root <path>]'
+    decided  = 'decided  [-WhatIf] [-Root <path>]'
+    provided = 'provided [-WhatIf] [-Root <path>]'
+    verify   = 'verify   [-Full] [-WhatIf] [-Root <path>]'
+    update   = 'update   [-WhatIf] [-Root <path>]'
+    reset    = 'reset    [-Month <yyyy-MM|all>] [-Force] [-WhatIf] [-Root <path>]'
+    export   = 'export   -Out <file> [-As <Csv|Jsonl>] [-From <yyyy-MM>] [-To <yyyy-MM>] [-Role <primary|companion|sidecar>] [-Columns <a,b,c>] [-Root <path>]'
 }
 
 function Write-Usage {
@@ -1045,6 +1225,7 @@ function Write-Usage {
         Write-Host "  $($Script:UsageText[$key])"
     }
     Write-Host ''
+    Write-Host "decided  processes _must-decide\keep; provided processes newly dated files in _must-provide"
     Write-Host '-Root defaults to the script folder'
 }
 
@@ -1057,13 +1238,14 @@ if (-not $Command) {
 
 try {
     switch ($Command) {
-        'init'   { Initialize-Sot @Rest }
-        'ingest' { Import-Batch @Rest }
-        'verify' { Test-Catalog @Rest }
-        'update' { Update-Catalog @Rest }
-        'reset'  { Reset-Catalog @Rest }
-        'export' { Export-Catalog @Rest }
-        default  {
+        'ingest'   { Import-Batch @Rest }
+        'decided'  { Import-Decisions @Rest }
+        'provided' { Import-Dates @Rest }
+        'verify'   { Test-Catalog @Rest }
+        'update'   { Update-Catalog @Rest }
+        'reset'    { Reset-Catalog @Rest }
+        'export'   { Export-Catalog @Rest }
+        default    {
             Write-Host "Unknown command: $Command"
             Write-Host ''
             Write-Usage
