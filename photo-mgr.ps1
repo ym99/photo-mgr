@@ -509,7 +509,7 @@ function Get-LibraryGroupFiles {
 
 function New-IngestStats {
     @{
-        'ingested'                   = 0
+        'added'                      = 0
         'complete-copy--same-bytes'  = 0
         'complete-copy--same-pixels' = 0
         'partial-copy'               = 0
@@ -522,10 +522,10 @@ function New-IngestStats {
 }
 
 function Write-Stats {
-    param($Paths, [int]$Processed = -1, [int]$Ingested = -1)
+    param($Paths, [int]$Ingested = -1, [int]$Added = -1)
     Write-Host ''
-    if ($Processed -ge 0) { Write-Host "Processed: $(Format-Count $Processed)" -ForegroundColor DarkGray }
-    if ($Ingested -ge 0) { Write-Host "Ingested: $(Format-Count $Ingested)" }
+    if ($Ingested -ge 0) { Write-Host "Ingested: $(Format-Count $Ingested)" -ForegroundColor Gray }
+    if ($Added -ge 0) { Write-Host "Added to library: $(Format-Count $Added)" -ForegroundColor Green }
     $buckets = @(
         [pscustomobject]@{ Path = $Paths.Keep;           Color = 'Cyan';   Hint = "  run 'ingest resume'" }
         [pscustomobject]@{ Path = $Paths.PartialCopy;    Color = 'Yellow'; Hint = '' }
@@ -718,7 +718,7 @@ function Invoke-GroupIngest {
 
         Add-ManifestRecord $destDir $record
         Add-RecordToIndex $Index $record $destDir
-        $Stats['ingested']++
+        $Stats['added']++
     }
 }
 
@@ -772,7 +772,7 @@ function Import-Batch {
     }
 
     Remove-EmptyInboxDirs -InboxRoot $inboxFull
-    Write-Stats $Paths -Processed $files.Count -Ingested $stats['ingested']
+    Write-Stats $Paths -Ingested $files.Count -Added $stats['added']
 }
 
 function Resume-Ingest {
@@ -821,7 +821,7 @@ function Resume-Ingest {
         Remove-EmptyInboxDirs -InboxRoot $Paths.DateMissing
     }
 
-    Write-Stats $Paths -Processed ($keepFiles.Count + $dateFiles.Count) -Ingested $stats['ingested']
+    Write-Stats $Paths -Ingested ($keepFiles.Count + $dateFiles.Count) -Added $stats['added']
 }
 
 function Get-LibraryFolders {
