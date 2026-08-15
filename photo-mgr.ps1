@@ -828,7 +828,7 @@ function Get-LibraryFolders {
 function Test-Catalog {
     [CmdletBinding()]
     param(
-        [switch]$Full,
+        [switch]$Deep,
         [string]$Root = $PSScriptRoot
     )
 
@@ -862,7 +862,7 @@ function Test-Catalog {
                 $findings.Add([pscustomobject]@{ issue = $issue; folder = $folder; name = $record.name; detail = "expected $($record.size), found $($file.Length)" })
                 continue
             }
-            if (-not $Full) { continue }
+            if (-not $Deep) { continue }
 
             $hash = Get-FileSha256 $file.FullName
             if ($hash -ne $record.hash_full) {
@@ -878,11 +878,11 @@ function Test-Catalog {
             $findings.Add([pscustomobject]@{ issue = 'orphan'; folder = $folder; name = $name; detail = 'file has no catalog record; run update' })
         }
 
-        if ($Full -and $changed) { Write-Manifest $folder $records }
+        if ($Deep -and $changed) { Write-Manifest $folder $records }
     }
 
     $bad = @($findings | Where-Object { $_.issue -in @('missing', 'zeroed', 'size-mismatch', 'corrupt') })
-    $mode = if ($Full) { 'full' } else { 'quick' }
+    $mode = if ($Deep) { 'deep' } else { 'quick' }
     Write-Host "Verify ($mode): $checked records checked, $($bad.Count) problems, $($findings.Count) findings total"
     foreach ($f in $findings) { Write-Host ("  [{0}] {1}\{2} {3}" -f $f.issue, $f.folder, $f.name, $f.detail) }
     Write-PendingSummary $Paths
@@ -1170,7 +1170,7 @@ function Export-Catalog {
 $Script:UsageText = [ordered]@{
     'ingest'          = 'ingest  -Inbox <folder> [-Root <path>]'
     'ingest resume'   = 'ingest  resume [-Root <path>]'
-    'catalog verify'  = 'catalog verify [-Full] [-Root <path>]'
+    'catalog verify'  = 'catalog verify [-Deep] [-Root <path>]'
     'catalog fix'     = 'catalog fix [-Root <path>]'
     'catalog rebuild' = 'catalog rebuild [-Month <yyyy-MM|all>] [-Force] [-Root <path>]'
     'catalog export'  = 'catalog export -Out <file> [-As <Csv|Jsonl>] [-From <yyyy-MM>] [-To <yyyy-MM>] [-Root <path>]'
