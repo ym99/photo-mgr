@@ -531,8 +531,8 @@ function Write-Stats {
         [pscustomobject]@{ Path = $Paths.PartialCopy;    Color = 'Yellow'; Hint = '' }
         [pscustomobject]@{ Path = $Paths.SuspectCopy;    Color = 'Yellow'; Hint = '' }
         [pscustomobject]@{ Path = $Paths.DateMissing;    Color = 'Yellow'; Hint = '' }
-        [pscustomobject]@{ Path = $Paths.CompleteBytes;  Color = 'Green';  Hint = '' }
-        [pscustomobject]@{ Path = $Paths.CompletePixels; Color = 'Green';  Hint = '' }
+        [pscustomobject]@{ Path = $Paths.CompleteBytes;  Color = 'Gray';   Hint = '' }
+        [pscustomobject]@{ Path = $Paths.CompletePixels; Color = 'Gray';   Hint = '' }
         [pscustomobject]@{ Path = $Paths.Damaged;        Color = 'Yellow'; Hint = '' }
         [pscustomobject]@{ Path = $Paths.NonMedia;       Color = 'Yellow'; Hint = '' }
         [pscustomobject]@{ Path = $Paths.OrphanSidecar;  Color = 'Yellow'; Hint = '' }
