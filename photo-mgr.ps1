@@ -43,7 +43,8 @@ function Get-SotPaths {
         PartialCopy   = Join-Path $decide 'partial-copy--group-has-new-files'
         SuspectCopy   = Join-Path $decide 'suspected-copy--same-time-and-camera-but-diff-hash'
         DateMissing   = Join-Path $provide 'date-missing--no-exif-or-filename'
-        CompleteCopy  = Join-Path $safe 'complete-copy--hash-match'
+        CompleteBytes  = Join-Path $safe 'complete-copy--same-bytes'
+        CompletePixels = Join-Path $safe 'complete-copy--same-pixels'
         Damaged       = Join-Path $safe 'damaged--zero-bytes'
         NonMedia      = Join-Path $safe 'non-media'
         OrphanSidecar = Join-Path $safe 'orphan-sidecar'
@@ -503,20 +504,21 @@ function Get-LibraryGroupFiles {
 
 function New-IngestStats {
     @{
-        'ingested'        = 0
-        'complete-copy'   = 0
-        'partial-copy'    = 0
-        'suspected-copy'  = 0
-        'date-missing'    = 0
-        'damaged'         = 0
-        'orphan-sidecar'  = 0
-        'non-media'       = 0
+        'ingested'                   = 0
+        'complete-copy--same-bytes'  = 0
+        'complete-copy--same-pixels' = 0
+        'partial-copy'               = 0
+        'suspected-copy'             = 0
+        'date-missing'               = 0
+        'damaged'                    = 0
+        'orphan-sidecar'             = 0
+        'non-media'                  = 0
     }
 }
 
 function Write-IngestSummary {
     param($Stats)
-    $parts = foreach ($key in @('ingested', 'complete-copy', 'partial-copy', 'suspected-copy', 'date-missing', 'damaged', 'orphan-sidecar', 'non-media')) {
+    $parts = foreach ($key in @('ingested', 'complete-copy--same-bytes', 'complete-copy--same-pixels', 'partial-copy', 'suspected-copy', 'date-missing', 'damaged', 'orphan-sidecar', 'non-media')) {
         if ($Stats[$key] -gt 0) { "$key $($Stats[$key])" }
     }
     if (-not $parts) { $parts = @('nothing processed') }
@@ -583,22 +585,28 @@ function Invoke-GroupIngest {
     $mediaMembers = @($members | Where-Object { (Get-ExtInfo $_.Extension).Kind -eq 'media' })
     $matchTarget = @{}
     $newOnes = @()
+    $pixelOnly = $false
     foreach ($m in $mediaMembers) {
         $hit = $null
         if ($Index.ByHash.ContainsKey($hashes[$m.FullName])) { $hit = $Index.ByHash[$hashes[$m.FullName]] }
         else {
             $img = Get-ImageDataHash (& $metaOf $m)
-            if ($img -and $Index.ByImage.ContainsKey($img)) { $hit = $Index.ByImage[$img] }
+            if ($img -and $Index.ByImage.ContainsKey($img)) {
+                $hit = $Index.ByImage[$img]
+                $pixelOnly = $true
+            }
         }
         $matchTarget[$m.FullName] = $hit
         if ($null -eq $hit) { $newOnes += $m }
     }
 
     if ($newOnes.Count -eq 0) {
+        $bucket = if ($pixelOnly) { $Paths.CompletePixels } else { $Paths.CompleteBytes }
+        $statKey = if ($pixelOnly) { 'complete-copy--same-pixels' } else { 'complete-copy--same-bytes' }
         foreach ($m in $members) {
-            Move-FileSafe -Source $m.FullName -Dest (Join-Path $Paths.CompleteCopy $m.Name) | Out-Null
+            Move-FileSafe -Source $m.FullName -Dest (Join-Path $bucket $m.Name) | Out-Null
         }
-        $Stats['complete-copy']++
+        $Stats[$statKey]++
         return
     }
 
