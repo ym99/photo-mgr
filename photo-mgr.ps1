@@ -90,6 +90,11 @@ function Get-UtcNowStamp {
     [DateTime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")
 }
 
+function Format-Count {
+    param([long]$Value)
+    $Value.ToString('N0', [System.Globalization.CultureInfo]::InvariantCulture)
+}
+
 function ConvertTo-JsonLine {
     param($Value)
     $json = $Value | ConvertTo-Json -Compress -Depth 4
@@ -223,7 +228,7 @@ function Get-MediaMetadata {
             }
         }
         finally { Remove-Item -LiteralPath $argFile -ErrorAction SilentlyContinue }
-        Write-Progress -Activity 'Reading metadata' -Status "$($last + 1) / $($Paths.Count)"
+        Write-Progress -Activity 'Reading metadata' -Status "$(Format-Count ($last + 1)) / $(Format-Count $Paths.Count)"
     }
     Write-Progress -Activity 'Reading metadata' -Completed
     $map
@@ -444,7 +449,7 @@ function Remove-EmptyInboxDirs {
             Write-Warning "Could not remove empty folder $($dir.FullName): $($_.Exception.Message)"
         }
     }
-    if ($removed -gt 0) { Write-Host "Removed $removed empty folder(s)" }
+    if ($removed -gt 0) { Write-Host "Removed empty folders: $(Format-Count $removed)" }
 }
 
 function Resolve-GroupBaseName {
@@ -516,14 +521,29 @@ function New-IngestStats {
     }
 }
 
-function Write-IngestSummary {
-    param($Stats)
-    $parts = foreach ($key in @('ingested', 'complete-copy--same-bytes', 'complete-copy--same-pixels', 'partial-copy', 'suspected-copy', 'date-missing', 'damaged', 'orphan-sidecar', 'non-media')) {
-        if ($Stats[$key] -gt 0) { "$key $($Stats[$key])" }
-    }
-    if (-not $parts) { $parts = @('nothing processed') }
+function Write-Stats {
+    param($Paths, [int]$Processed = -1, [int]$Ingested = -1)
     Write-Host ''
-    Write-Host ("Groups: " + ($parts -join '  '))
+    if ($Processed -ge 0) { Write-Host "Processed: $(Format-Count $Processed)" -ForegroundColor DarkGray }
+    if ($Ingested -ge 0) { Write-Host "Ingested: $(Format-Count $Ingested)" }
+    $buckets = @(
+        [pscustomobject]@{ Path = $Paths.Keep;           Color = 'Cyan';   Hint = "  run 'ingest resume'" }
+        [pscustomobject]@{ Path = $Paths.PartialCopy;    Color = 'Yellow'; Hint = '' }
+        [pscustomobject]@{ Path = $Paths.SuspectCopy;    Color = 'Yellow'; Hint = '' }
+        [pscustomobject]@{ Path = $Paths.DateMissing;    Color = 'Yellow'; Hint = '' }
+        [pscustomobject]@{ Path = $Paths.CompleteBytes;  Color = 'Green';  Hint = '' }
+        [pscustomobject]@{ Path = $Paths.CompletePixels; Color = 'Green';  Hint = '' }
+        [pscustomobject]@{ Path = $Paths.Damaged;        Color = 'Yellow'; Hint = '' }
+        [pscustomobject]@{ Path = $Paths.NonMedia;       Color = 'Yellow'; Hint = '' }
+        [pscustomobject]@{ Path = $Paths.OrphanSidecar;  Color = 'Yellow'; Hint = '' }
+    )
+    $rootLen = $Paths.Root.TrimEnd('\').Length + 1
+    foreach ($bucket in $buckets) {
+        $count = Get-BucketFileCount $bucket.Path -Recurse
+        if ($count -gt 0) {
+            Write-Host ('{0}: {1}{2}' -f $bucket.Path.Substring($rootLen), (Format-Count $count), $bucket.Hint) -ForegroundColor $bucket.Color
+        }
+    }
 }
 
 function Get-BucketFileCount {
@@ -531,19 +551,6 @@ function Get-BucketFileCount {
     if (-not (Test-Path -LiteralPath $Dir)) { return 0 }
     @(Get-ChildItem -LiteralPath $Dir -File -Recurse:$Recurse |
         Where-Object { $_.Name -notlike "*$($Script:TwinMarker)*" -and $_.Name -ne $Script:ManifestName }).Count
-}
-
-function Write-PendingSummary {
-    param($Paths)
-    $partial = Get-BucketFileCount $Paths.PartialCopy
-    $suspect = Get-BucketFileCount $Paths.SuspectCopy
-    $keep = Get-BucketFileCount $Paths.Keep -Recurse
-    $dates = Get-BucketFileCount $Paths.DateMissing -Recurse
-    if ($partial -gt 0 -or $suspect -gt 0) {
-        Write-Host "_must-decide pending: $partial partial-copy, $suspect suspected-copy"
-    }
-    if ($keep -gt 0)  { Write-Host "_must-decide\keep holds $keep file(s) awaiting 'ingest resume'" }
-    if ($dates -gt 0) { Write-Host "_must-provide holds $dates file(s) awaiting dates ('ingest resume' after dating)" }
 }
 
 function Invoke-GroupIngest {
@@ -711,8 +718,8 @@ function Invoke-GroupIngest {
 
         Add-ManifestRecord $destDir $record
         Add-RecordToIndex $Index $record $destDir
+        $Stats['ingested']++
     }
-    $Stats['ingested']++
 }
 
 function Get-IngestibleFiles {
@@ -753,10 +760,10 @@ function Import-Batch {
     $files = Get-IngestibleFiles $inboxFull
     if ($files.Count -eq 0) { Write-Host 'Nothing to ingest.'; return }
 
-    Write-Host "Ingesting $($files.Count) files from $inboxFull"
+    Write-Host "Ingesting $(Format-Count $files.Count) files from $inboxFull"
     $meta = Get-MediaMetadata @($files.FullName)
     $index = New-CatalogIndex $Paths.Library
-    Write-Host "Index loaded: $($index.Records) records"
+    Write-Host "Catalog loaded: $(Format-Count $index.Records) records"
 
     $stats = New-IngestStats
     foreach ($group in (Get-AssetGroups $files)) {
@@ -765,8 +772,7 @@ function Import-Batch {
     }
 
     Remove-EmptyInboxDirs -InboxRoot $inboxFull
-    Write-IngestSummary $stats
-    Write-PendingSummary $Paths
+    Write-Stats $Paths -Processed $files.Count -Ingested $stats['ingested']
 }
 
 function Resume-Ingest {
@@ -781,7 +787,7 @@ function Resume-Ingest {
     $dateFiles = Get-IngestibleFiles $Paths.DateMissing
     if ($keepFiles.Count -eq 0 -and $dateFiles.Count -eq 0) {
         Write-Host 'Nothing to resume.'
-        Write-PendingSummary $Paths
+        Write-Stats $Paths
         return
     }
 
@@ -793,35 +799,29 @@ function Resume-Ingest {
     $stats = New-IngestStats
 
     if ($keepFiles.Count -gt 0) {
-        Write-Host "Resuming $($keepFiles.Count) decided file(s) from keep"
+        Write-Host "Resuming $(Format-Count $keepFiles.Count) decided file(s) from keep"
         foreach ($group in (Get-AssetGroups $keepFiles)) {
             Invoke-GroupIngest -Paths $Paths -Group $group -Meta $meta -Index $index `
                 -InboxRoot $Paths.Keep -Stats $stats -SkipExifTier
         }
     }
 
-    $stillUndated = 0
     if ($dateFiles.Count -gt 0) {
-        Write-Host "Checking $($dateFiles.Count) file(s) awaiting dates"
+        Write-Host "Checking $(Format-Count $dateFiles.Count) file(s) awaiting dates"
         foreach ($group in (Get-AssetGroups $dateFiles)) {
             $resolved = $null
             foreach ($m in @($group.Members | Where-Object { (Get-ExtInfo $_.Extension).Kind -eq 'media' })) {
                 $resolved = Resolve-DateTaken $meta[$m.FullName.ToLowerInvariant()] $m.Name
                 if ($resolved) { break }
             }
-            if ($null -eq $resolved) {
-                $stillUndated += $group.Members.Count
-                continue
-            }
+            if ($null -eq $resolved) { continue }
             Invoke-GroupIngest -Paths $Paths -Group $group -Meta $meta -Index $index `
                 -InboxRoot $Paths.DateMissing -Stats $stats -ForceManualDate
         }
         Remove-EmptyInboxDirs -InboxRoot $Paths.DateMissing
     }
 
-    Write-IngestSummary $stats
-    if ($stillUndated -gt 0) { Write-Host "Still need a date: $stillUndated file(s)" }
-    Write-PendingSummary $Paths
+    Write-Stats $Paths -Processed ($keepFiles.Count + $dateFiles.Count) -Ingested $stats['ingested']
 }
 
 function Get-LibraryFolders {
@@ -891,9 +891,12 @@ function Test-Catalog {
 
     $bad = @($findings | Where-Object { $_.issue -in @('missing', 'zeroed', 'size-mismatch', 'corrupt') })
     $mode = if ($Deep) { 'deep' } else { 'quick' }
-    Write-Host "Verify ($mode): $checked records checked, $($bad.Count) problems, $($findings.Count) findings total"
-    foreach ($f in $findings) { Write-Host ("  [{0}] {1}\{2} {3}" -f $f.issue, $f.folder, $f.name, $f.detail) }
-    Write-PendingSummary $Paths
+    Write-Host "Verify ($mode): $(Format-Count $checked) records checked, $(Format-Count $bad.Count) problems, $(Format-Count $findings.Count) findings total"
+    foreach ($f in $findings) {
+        $color = if ($f.issue -in @('corrupt', 'missing', 'zeroed', 'size-mismatch')) { 'Red' } else { 'Yellow' }
+        Write-Host ("  [{0}] {1}\{2} {3}" -f $f.issue, $f.folder, $f.name, $f.detail) -ForegroundColor $color
+    }
+    Write-Stats $Paths
     $findings
 }
 
@@ -1012,7 +1015,7 @@ function Update-Catalog {
             }
         }
     }
-    Write-Host "Update: $added records appended, $rearmed read-only attributes restored, $skipped files left uncataloged"
+    Write-Host "Update: $(Format-Count $added) records appended, $(Format-Count $rearmed) read-only attributes restored, $(Format-Count $skipped) files left uncataloged"
 }
 
 function Reset-Catalog {
@@ -1111,7 +1114,7 @@ function Reset-Catalog {
         }
 
         Write-Manifest $folder $records
-        Write-Host "Rebuilt $folder : $($records.Count) records"
+        Write-Host "Rebuilt $folder : $(Format-Count $records.Count) records"
     }
 }
 
@@ -1172,7 +1175,7 @@ function Export-Catalog {
         }
     }
     finally { $writer.Dispose() }
-    Write-Host "Exported $count records to $Out"
+    Write-Host "Exported $(Format-Count $count) records to $Out"
 }
 
 $Script:UsageText = [ordered]@{
