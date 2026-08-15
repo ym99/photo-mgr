@@ -407,7 +407,6 @@ function Add-RecordToIndex {
 }
 
 function Move-FileSafe {
-    [CmdletBinding(SupportsShouldProcess)]
     param([string]$Source, [string]$Dest)
     $destDir = Split-Path -Parent $Dest
     if (-not (Test-Path -LiteralPath $destDir)) { New-Item -ItemType Directory -Path $destDir -Force | Out-Null }
@@ -419,11 +418,8 @@ function Move-FileSafe {
         $ext = [System.IO.Path]::GetExtension($Dest)
         $final = Join-Path $destDir ('{0}_{1:d3}{2}' -f $base, $i, $ext)
     }
-    if ($PSCmdlet.ShouldProcess($final, "Move from $Source")) {
-        Move-Item -LiteralPath $Source -Destination $final
-        return $final
-    }
-    $null
+    Move-Item -LiteralPath $Source -Destination $final
+    $final
 }
 
 function Move-ToBucket {
@@ -433,21 +429,18 @@ function Move-ToBucket {
 }
 
 function Remove-EmptyInboxDirs {
-    [CmdletBinding(SupportsShouldProcess)]
     param([string]$InboxRoot)
     $removed = 0
     $dirs = @(Get-ChildItem -LiteralPath $InboxRoot -Recurse -Directory |
         Sort-Object { $_.FullName.Length } -Descending)
     foreach ($dir in $dirs) {
         if (@(Get-ChildItem -LiteralPath $dir.FullName -Force).Count -gt 0) { continue }
-        if ($PSCmdlet.ShouldProcess($dir.FullName, 'Remove empty folder')) {
-            try {
-                Remove-Item -LiteralPath $dir.FullName
-                $removed++
-            }
-            catch {
-                Write-Warning "Could not remove empty folder $($dir.FullName): $($_.Exception.Message)"
-            }
+        try {
+            Remove-Item -LiteralPath $dir.FullName
+            $removed++
+        }
+        catch {
+            Write-Warning "Could not remove empty folder $($dir.FullName): $($_.Exception.Message)"
         }
     }
     if ($removed -gt 0) { Write-Host "Removed $removed empty folder(s)" }
@@ -552,7 +545,7 @@ function Write-PendingSummary {
 }
 
 function Invoke-GroupIngest {
-    [CmdletBinding(SupportsShouldProcess)]
+    [CmdletBinding()]
     param(
         $Paths, $Group, $Meta, $Index, [string]$InboxRoot, $Stats,
         [switch]$SkipExifTier, [switch]$ForceManualDate
@@ -612,7 +605,7 @@ function Invoke-GroupIngest {
     if ($newOnes.Count -lt $mediaMembers.Count) {
         foreach ($m in $members) {
             $moved = Move-FileSafe -Source $m.FullName -Dest (Join-Path $Paths.PartialCopy $m.Name)
-            if ($moved -and $matchTarget.ContainsKey($m.FullName) -and $matchTarget[$m.FullName]) {
+            if ($matchTarget.ContainsKey($m.FullName) -and $matchTarget[$m.FullName]) {
                 Copy-LibraryTwin $moved $matchTarget[$m.FullName]
             }
         }
@@ -644,7 +637,6 @@ function Invoke-GroupIngest {
             if (-not $libPrimary) { $libPrimary = $libGroup | Select-Object -First 1 }
             foreach ($m in $members) {
                 $moved = Move-FileSafe -Source $m.FullName -Dest (Join-Path $Paths.SuspectCopy $m.Name)
-                if ($null -eq $moved) { continue }
                 $info = Get-ExtInfo $m.Extension
                 $isPrimary = $m.FullName -eq $Group.Primary.FullName
                 $counterpart = $null
@@ -683,7 +675,6 @@ function Invoke-GroupIngest {
         $origName = ConvertTo-Nfc $m.Name
 
         $moved = Move-FileSafe -Source $m.FullName -Dest (Join-Path $destDir ($base + $m.Extension))
-        if ($null -eq $moved) { continue }
         [System.IO.File]::SetLastWriteTime($moved, $resolved.Date)
         Set-FileReadOnly $moved $true
 
@@ -728,7 +719,7 @@ function Get-IngestibleFiles {
 }
 
 function Import-Batch {
-    [CmdletBinding(SupportsShouldProcess)]
+    [CmdletBinding()]
     param(
         [string]$Inbox,
         [string]$Root = $PSScriptRoot
@@ -771,7 +762,7 @@ function Import-Batch {
 }
 
 function Resume-Ingest {
-    [CmdletBinding(SupportsShouldProcess)]
+    [CmdletBinding()]
     param([string]$Root = $PSScriptRoot)
 
     $Script:ExifTool = Resolve-ExifTool
@@ -835,7 +826,7 @@ function Get-LibraryFolders {
 }
 
 function Test-Catalog {
-    [CmdletBinding(SupportsShouldProcess)]
+    [CmdletBinding()]
     param(
         [switch]$Full,
         [string]$Root = $PSScriptRoot
@@ -843,7 +834,6 @@ function Test-Catalog {
 
     $Paths = Get-SotPaths $Root
     Assert-SotRoot $Paths
-    $dryRun = [bool]$WhatIfPreference
     $now = Get-UtcNowStamp
     $findings = [System.Collections.Generic.List[object]]::new()
     $checked = 0
@@ -888,7 +878,7 @@ function Test-Catalog {
             $findings.Add([pscustomobject]@{ issue = 'orphan'; folder = $folder; name = $name; detail = 'file has no catalog record; run update' })
         }
 
-        if ($Full -and $changed -and -not $dryRun) { Write-Manifest $folder $records }
+        if ($Full -and $changed) { Write-Manifest $folder $records }
     }
 
     $bad = @($findings | Where-Object { $_.issue -in @('missing', 'zeroed', 'size-mismatch', 'corrupt') })
@@ -906,7 +896,7 @@ function Get-OrigFromName {
 }
 
 function Update-Catalog {
-    [CmdletBinding(SupportsShouldProcess)]
+    [CmdletBinding()]
     param([string]$Root = $PSScriptRoot)
 
     $Script:ExifTool = Resolve-ExifTool
@@ -929,10 +919,8 @@ function Update-Catalog {
             }
             $item = Get-Item -LiteralPath $p
             if (-not $item.IsReadOnly) {
-                if ($PSCmdlet.ShouldProcess($p, 'Restore read-only attribute')) {
-                    $item.IsReadOnly = $true
-                    $rearmed++
-                }
+                $item.IsReadOnly = $true
+                $rearmed++
             }
         }
 
@@ -1010,10 +998,8 @@ function Update-Catalog {
                     -CameraSerial ($(if ($isSidecar) { $null } else { Get-Tag $mMeta @('SerialNumber', 'BodySerialNumber') })) `
                     -OrigFilename (Get-OrigFromName $m.Name) -IngestedAt $now
 
-                if ($PSCmdlet.ShouldProcess("$folder\$($m.Name)", 'Append catalog record')) {
-                    Add-ManifestRecord $folder $record
-                    Set-FileReadOnly $m.FullName $true
-                }
+                Add-ManifestRecord $folder $record
+                Set-FileReadOnly $m.FullName $true
                 $added++
             }
         }
@@ -1022,7 +1008,7 @@ function Update-Catalog {
 }
 
 function Reset-Catalog {
-    [CmdletBinding(SupportsShouldProcess)]
+    [CmdletBinding()]
     param(
         [string]$Month = 'all',
         [switch]$Force,
@@ -1041,10 +1027,10 @@ function Reset-Catalog {
 
     if (-not $Force) {
         $msg = "Rebuild will regenerate catalog records in $($folders.Count) folder(s), discarding stored hashes (corruption evidence)."
-        if (-not $PSCmdlet.ShouldContinue($msg, 'photo-mgr catalog rebuild')) { return }
+        $choice = $Host.UI.PromptForChoice('photo-mgr catalog rebuild', $msg, @('&Yes', '&No'), 1)
+        if ($choice -ne 0) { return }
     }
 
-    $dryRun = [bool]$WhatIfPreference
     foreach ($folder in $folders) {
         $old = @{}
         foreach ($r in (Read-Manifest $folder)) { $old[[string]$r.hash_full] = $r }
@@ -1116,10 +1102,8 @@ function Reset-Catalog {
             }
         }
 
-        if (-not $dryRun -and $PSCmdlet.ShouldProcess($folder, 'Rewrite manifest')) {
-            Write-Manifest $folder $records
-        }
-        Write-Host "Reset $folder : $($records.Count) records"
+        Write-Manifest $folder $records
+        Write-Host "Rebuilt $folder : $($records.Count) records"
     }
 }
 
@@ -1138,28 +1122,23 @@ function Export-Catalog {
         [string]$Out,
         [string]$From,
         [string]$To,
-        [ValidateSet('primary', 'companion', 'sidecar')]
-        [string]$Role,
-        [string[]]$Columns,
         [string]$Root = $PSScriptRoot
     )
 
     $Paths = Get-SotPaths $Root
     Assert-SotRoot $Paths
     if (-not $Out) { Write-Usage 'catalog export'; throw 'catalog export requires -Out' }
-    $allColumns = @('name', 'role', 'primary', 'size', 'hash_full', 'hash_imagedata',
+    $columns = @('name', 'role', 'primary', 'size', 'hash_full', 'hash_imagedata',
         'date_taken', 'date_source', 'tz_offset', 'width', 'height', 'duration',
         'camera_make', 'camera_model', 'camera_serial', 'orig_filename',
         'ingested_at', 'last_verified', 'year', 'month', 'ext')
-    $selected = if ($Columns) { @($Columns | Where-Object { $allColumns -contains $_ }) } else { $allColumns }
-    if ($selected.Count -eq 0) { throw "No valid columns; available: $($allColumns -join ', ')" }
 
     $encoding = if ($As -eq 'Csv') { [System.Text.UTF8Encoding]::new($true) } else { $Script:Utf8NoBom }
     $writer = [System.IO.StreamWriter]::new([System.IO.Path]::GetFullPath($Out), $false, $encoding)
     $count = 0
     try {
         if ($As -eq 'Csv') {
-            $writer.WriteLine(($selected -join ','))
+            $writer.WriteLine(($columns -join ','))
         }
         foreach ($folder in (Get-LibraryFolders $Paths | Sort-Object)) {
             $leaf = Split-Path -Leaf $folder
@@ -1168,7 +1147,6 @@ function Export-Catalog {
             if ($To -and $leaf -gt $To) { continue }
 
             foreach ($record in (Read-Manifest $folder)) {
-                if ($Role -and $record.role -ne $Role) { continue }
                 $augmented = [ordered]@{}
                 foreach ($prop in $record.PSObject.Properties) { $augmented[$prop.Name] = $prop.Value }
                 $augmented['year'] = [int]([string]$record.date_taken).Substring(0, 4)
@@ -1176,7 +1154,7 @@ function Export-Catalog {
                 $augmented['ext'] = [System.IO.Path]::GetExtension([string]$record.name).TrimStart('.').ToLowerInvariant()
 
                 if ($As -eq 'Csv') {
-                    $writer.WriteLine((@($selected | ForEach-Object { ConvertTo-CsvField $augmented[$_] }) -join ','))
+                    $writer.WriteLine((@($columns | ForEach-Object { ConvertTo-CsvField $augmented[$_] }) -join ','))
                 }
                 else {
                     $writer.WriteLine((ConvertTo-JsonLine $augmented))
@@ -1190,12 +1168,12 @@ function Export-Catalog {
 }
 
 $Script:UsageText = [ordered]@{
-    'ingest'          = 'ingest  -Inbox <folder> [-WhatIf] [-Root <path>]'
-    'ingest resume'   = 'ingest  resume [-WhatIf] [-Root <path>]'
-    'catalog verify'  = 'catalog verify [-Full] [-WhatIf] [-Root <path>]'
-    'catalog fix'     = 'catalog fix [-WhatIf] [-Root <path>]'
-    'catalog rebuild' = 'catalog rebuild [-Month <yyyy-MM|all>] [-Force] [-WhatIf] [-Root <path>]'
-    'catalog export'  = 'catalog export -Out <file> [-As <Csv|Jsonl>] [-From <yyyy-MM>] [-To <yyyy-MM>] [-Role <primary|companion|sidecar>] [-Columns <a,b,c>] [-Root <path>]'
+    'ingest'          = 'ingest  -Inbox <folder> [-Root <path>]'
+    'ingest resume'   = 'ingest  resume [-Root <path>]'
+    'catalog verify'  = 'catalog verify [-Full] [-Root <path>]'
+    'catalog fix'     = 'catalog fix [-Root <path>]'
+    'catalog rebuild' = 'catalog rebuild [-Month <yyyy-MM|all>] [-Force] [-Root <path>]'
+    'catalog export'  = 'catalog export -Out <file> [-As <Csv|Jsonl>] [-From <yyyy-MM>] [-To <yyyy-MM>] [-Root <path>]'
 }
 
 function Write-Usage {
@@ -1204,10 +1182,9 @@ function Write-Usage {
         Write-Host "usage: photo-mgr.ps1 $($Script:UsageText[$Only])"
         return
     }
-    Write-Host 'usage: photo-mgr.ps1 <command> [options]'
-    Write-Host ''
+    Write-Host 'usage:'
     foreach ($key in $Script:UsageText.Keys) {
-        Write-Host "  $($Script:UsageText[$key])"
+        Write-Host "  photo-mgr.ps1 $($Script:UsageText[$key])"
     }
     Write-Host ''
     Write-Host "ingest resume applies your finished work: _must-decide\keep and newly dated _must-provide files"
