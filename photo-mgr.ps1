@@ -547,8 +547,8 @@ function Write-PendingSummary {
     if ($partial -gt 0 -or $suspect -gt 0) {
         Write-Host "_must-decide pending: $partial partial-copy, $suspect suspected-copy"
     }
-    if ($keep -gt 0)  { Write-Host "_must-decide\keep holds $keep file(s) awaiting 'decided'" }
-    if ($dates -gt 0) { Write-Host "_must-provide holds $dates file(s) awaiting dates ('provided' after dating)" }
+    if ($keep -gt 0)  { Write-Host "_must-decide\keep holds $keep file(s) awaiting 'ingest resume'" }
+    if ($dates -gt 0) { Write-Host "_must-provide holds $dates file(s) awaiting dates ('ingest resume' after dating)" }
 }
 
 function Invoke-GroupIngest {
@@ -770,7 +770,7 @@ function Import-Batch {
     Write-PendingSummary $Paths
 }
 
-function Import-Decisions {
+function Resume-Ingest {
     [CmdletBinding(SupportsShouldProcess)]
     param([string]$Root = $PSScriptRoot)
 
@@ -778,64 +778,50 @@ function Import-Decisions {
     $Paths = Get-SotPaths $Root
     Assert-SotRoot $Paths
 
-    $files = Get-IngestibleFiles $Paths.Keep
-    if ($files.Count -eq 0) {
-        Write-Host 'keep is empty - no decisions to apply.'
+    $keepFiles = Get-IngestibleFiles $Paths.Keep
+    $dateFiles = Get-IngestibleFiles $Paths.DateMissing
+    if ($keepFiles.Count -eq 0 -and $dateFiles.Count -eq 0) {
+        Write-Host 'Nothing to resume.'
         Write-PendingSummary $Paths
         return
     }
 
-    Write-Host "Applying $($files.Count) decided files from $($Paths.Keep)"
-    $meta = Get-MediaMetadata @($files.FullName)
+    $allPaths = [System.Collections.Generic.List[string]]::new()
+    foreach ($f in $keepFiles) { $allPaths.Add($f.FullName) }
+    foreach ($f in $dateFiles) { $allPaths.Add($f.FullName) }
+    $meta = Get-MediaMetadata $allPaths.ToArray()
     $index = New-CatalogIndex $Paths.Library
     $stats = New-IngestStats
-    foreach ($group in (Get-AssetGroups $files)) {
-        Invoke-GroupIngest -Paths $Paths -Group $group -Meta $meta -Index $index `
-            -InboxRoot $Paths.Keep -Stats $stats -SkipExifTier
+
+    if ($keepFiles.Count -gt 0) {
+        Write-Host "Resuming $($keepFiles.Count) decided file(s) from keep"
+        foreach ($group in (Get-AssetGroups $keepFiles)) {
+            Invoke-GroupIngest -Paths $Paths -Group $group -Meta $meta -Index $index `
+                -InboxRoot $Paths.Keep -Stats $stats -SkipExifTier
+        }
     }
 
-    Write-IngestSummary $stats
-    Write-PendingSummary $Paths
-}
-
-function Import-Dates {
-    [CmdletBinding(SupportsShouldProcess)]
-    param([string]$Root = $PSScriptRoot)
-
-    $Script:ExifTool = Resolve-ExifTool
-    $Paths = Get-SotPaths $Root
-    Assert-SotRoot $Paths
-
-    $files = Get-IngestibleFiles $Paths.DateMissing
-    if ($files.Count -eq 0) {
-        Write-Host 'Nothing awaits a date.'
-        Write-PendingSummary $Paths
-        return
-    }
-
-    Write-Host "Checking $($files.Count) files in $($Paths.DateMissing)"
-    $meta = Get-MediaMetadata @($files.FullName)
-    $index = New-CatalogIndex $Paths.Library
-    $stats = New-IngestStats
     $stillUndated = 0
-
-    foreach ($group in (Get-AssetGroups $files)) {
-        $resolved = $null
-        foreach ($m in @($group.Members | Where-Object { (Get-ExtInfo $_.Extension).Kind -eq 'media' })) {
-            $resolved = Resolve-DateTaken $meta[$m.FullName.ToLowerInvariant()] $m.Name
-            if ($resolved) { break }
+    if ($dateFiles.Count -gt 0) {
+        Write-Host "Checking $($dateFiles.Count) file(s) awaiting dates"
+        foreach ($group in (Get-AssetGroups $dateFiles)) {
+            $resolved = $null
+            foreach ($m in @($group.Members | Where-Object { (Get-ExtInfo $_.Extension).Kind -eq 'media' })) {
+                $resolved = Resolve-DateTaken $meta[$m.FullName.ToLowerInvariant()] $m.Name
+                if ($resolved) { break }
+            }
+            if ($null -eq $resolved) {
+                $stillUndated += $group.Members.Count
+                continue
+            }
+            Invoke-GroupIngest -Paths $Paths -Group $group -Meta $meta -Index $index `
+                -InboxRoot $Paths.DateMissing -Stats $stats -ForceManualDate
         }
-        if ($null -eq $resolved) {
-            $stillUndated += $group.Members.Count
-            continue
-        }
-        Invoke-GroupIngest -Paths $Paths -Group $group -Meta $meta -Index $index `
-            -InboxRoot $Paths.DateMissing -Stats $stats -ForceManualDate
+        Remove-EmptyInboxDirs -InboxRoot $Paths.DateMissing
     }
 
-    Remove-EmptyInboxDirs -InboxRoot $Paths.DateMissing
     Write-IngestSummary $stats
-    Write-Host "Still need a date: $stillUndated file(s)"
+    if ($stillUndated -gt 0) { Write-Host "Still need a date: $stillUndated file(s)" }
     Write-PendingSummary $Paths
 }
 
@@ -1048,14 +1034,14 @@ function Reset-Catalog {
     Assert-SotRoot $Paths
     $folders = Get-LibraryFolders $Paths
     if ($Month -ne 'all') {
-        if ($Month -notmatch '^\d{4}-\d{2}$') { Write-Usage 'reset'; throw "reset -Month expects 'yyyy-MM' or 'all'" }
+        if ($Month -notmatch '^\d{4}-\d{2}$') { Write-Usage 'catalog rebuild'; throw "catalog rebuild -Month expects 'yyyy-MM' or 'all'" }
         $folders = @($folders | Where-Object { (Split-Path -Leaf $_) -eq $Month })
         if ($folders.Count -eq 0) { throw "No library folder found for $Month" }
     }
 
     if (-not $Force) {
-        $msg = "Reset will regenerate catalog records in $($folders.Count) folder(s), discarding stored hashes (corruption evidence)."
-        if (-not $PSCmdlet.ShouldContinue($msg, 'photo-mgr reset')) { return }
+        $msg = "Rebuild will regenerate catalog records in $($folders.Count) folder(s), discarding stored hashes (corruption evidence)."
+        if (-not $PSCmdlet.ShouldContinue($msg, 'photo-mgr catalog rebuild')) { return }
     }
 
     $dryRun = [bool]$WhatIfPreference
@@ -1160,7 +1146,7 @@ function Export-Catalog {
 
     $Paths = Get-SotPaths $Root
     Assert-SotRoot $Paths
-    if (-not $Out) { Write-Usage 'export'; throw 'export requires -Out' }
+    if (-not $Out) { Write-Usage 'catalog export'; throw 'catalog export requires -Out' }
     $allColumns = @('name', 'role', 'primary', 'size', 'hash_full', 'hash_imagedata',
         'date_taken', 'date_source', 'tz_offset', 'width', 'height', 'duration',
         'camera_make', 'camera_model', 'camera_serial', 'orig_filename',
@@ -1204,13 +1190,12 @@ function Export-Catalog {
 }
 
 $Script:UsageText = [ordered]@{
-    ingest   = 'ingest   -Inbox <folder> [-WhatIf] [-Root <path>]'
-    decided  = 'decided  [-WhatIf] [-Root <path>]'
-    provided = 'provided [-WhatIf] [-Root <path>]'
-    verify   = 'verify   [-Full] [-WhatIf] [-Root <path>]'
-    update   = 'update   [-WhatIf] [-Root <path>]'
-    reset    = 'reset    [-Month <yyyy-MM|all>] [-Force] [-WhatIf] [-Root <path>]'
-    export   = 'export   -Out <file> [-As <Csv|Jsonl>] [-From <yyyy-MM>] [-To <yyyy-MM>] [-Role <primary|companion|sidecar>] [-Columns <a,b,c>] [-Root <path>]'
+    'ingest'          = 'ingest  -Inbox <folder> [-WhatIf] [-Root <path>]'
+    'ingest resume'   = 'ingest  resume [-WhatIf] [-Root <path>]'
+    'catalog verify'  = 'catalog verify [-Full] [-WhatIf] [-Root <path>]'
+    'catalog fix'     = 'catalog fix [-WhatIf] [-Root <path>]'
+    'catalog rebuild' = 'catalog rebuild [-Month <yyyy-MM|all>] [-Force] [-WhatIf] [-Root <path>]'
+    'catalog export'  = 'catalog export -Out <file> [-As <Csv|Jsonl>] [-From <yyyy-MM>] [-To <yyyy-MM>] [-Role <primary|companion|sidecar>] [-Columns <a,b,c>] [-Root <path>]'
 }
 
 function Write-Usage {
@@ -1225,7 +1210,7 @@ function Write-Usage {
         Write-Host "  $($Script:UsageText[$key])"
     }
     Write-Host ''
-    Write-Host "decided  processes _must-decide\keep; provided processes newly dated files in _must-provide"
+    Write-Host "ingest resume applies your finished work: _must-decide\keep and newly dated _must-provide files"
     Write-Host '-Root defaults to the script folder'
 }
 
@@ -1236,16 +1221,37 @@ if (-not $Command) {
     exit 1
 }
 
+$Script:UsageKey = $null
 try {
     switch ($Command) {
-        'ingest'   { Import-Batch @Rest }
-        'decided'  { Import-Decisions @Rest }
-        'provided' { Import-Dates @Rest }
-        'verify'   { Test-Catalog @Rest }
-        'update'   { Update-Catalog @Rest }
-        'reset'    { Reset-Catalog @Rest }
-        'export'   { Export-Catalog @Rest }
-        default    {
+        'ingest' {
+            if (@($Rest).Count -gt 0 -and "$($Rest[0])" -eq 'resume') {
+                $Script:UsageKey = 'ingest resume'
+                $subArgs = @(@($Rest) | Select-Object -Skip 1)
+                Resume-Ingest @subArgs
+            }
+            else {
+                $Script:UsageKey = 'ingest'
+                Import-Batch @Rest
+            }
+        }
+        'catalog' {
+            $sub = if (@($Rest).Count -gt 0) { "$($Rest[0])" } else { '' }
+            $subArgs = @(@($Rest) | Select-Object -Skip 1)
+            switch ($sub) {
+                'verify'  { $Script:UsageKey = 'catalog verify';  Test-Catalog @subArgs }
+                'fix'     { $Script:UsageKey = 'catalog fix';     Update-Catalog @subArgs }
+                'rebuild' { $Script:UsageKey = 'catalog rebuild'; Reset-Catalog @subArgs }
+                'export'  { $Script:UsageKey = 'catalog export';  Export-Catalog @subArgs }
+                default {
+                    Write-Host "Unknown catalog command: $sub"
+                    Write-Host ''
+                    Write-Usage
+                    exit 1
+                }
+            }
+        }
+        default {
             Write-Host "Unknown command: $Command"
             Write-Host ''
             Write-Usage
@@ -1256,6 +1262,6 @@ try {
 catch [System.Management.Automation.ParameterBindingException] {
     Write-Host $_.Exception.Message
     Write-Host ''
-    Write-Usage $Command
+    Write-Usage $Script:UsageKey
     exit 1
 }
