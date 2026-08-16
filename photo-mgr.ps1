@@ -1,12 +1,6 @@
 #requires -Version 7.0
-[CmdletBinding()]
-param(
-    [Parameter(Position = 0)]
-    [string]$Command,
-
-    [Parameter(ValueFromRemainingArguments)]
-    [object[]]$Rest = @()
-)
+# plain param block on purpose: [CmdletBinding()] rejects options that prefix a common parameter (-Out)
+param([string]$Command)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -95,6 +89,15 @@ function Format-Count {
     $Value.ToString('N0', [System.Globalization.CultureInfo]::InvariantCulture)
 }
 
+function Format-Size {
+    param([long]$Bytes)
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    if ($Bytes -ge 1TB) { return '{0} TB' -f ($Bytes / 1TB).ToString('N2', $inv) }
+    if ($Bytes -ge 1GB) { return '{0} GB' -f ($Bytes / 1GB).ToString('N2', $inv) }
+    if ($Bytes -ge 1MB) { return '{0} MB' -f ($Bytes / 1MB).ToString('N2', $inv) }
+    '{0} bytes' -f (Format-Count $Bytes)
+}
+
 function ConvertTo-JsonLine {
     param($Value)
     $json = $Value | ConvertTo-Json -Compress -Depth 4
@@ -107,6 +110,20 @@ function Get-ManifestPath {
     Join-Path $Folder $Script:ManifestName
 }
 
+# ConvertFrom-Json turns ISO-8601 strings into [datetime]; put them back as written
+function Restore-RecordDates {
+    param($Record)
+    if ($Record.date_taken -is [datetime]) {
+        $Record.date_taken = $Record.date_taken.ToString("yyyy-MM-dd'T'HH:mm:ss")
+    }
+    foreach ($name in @('ingested_at', 'last_verified')) {
+        if ($Record.$name -is [datetime]) {
+            $Record.$name = $Record.$name.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")
+        }
+    }
+    $Record
+}
+
 function Read-Manifest {
     param([string]$Folder)
     $records = [System.Collections.Generic.List[object]]::new()
@@ -116,7 +133,7 @@ function Read-Manifest {
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $line = $lines[$i].Trim()
         if ($line -eq '') { continue }
-        try { $records.Add(($line | ConvertFrom-Json)) }
+        try { $records.Add((Restore-RecordDates ($line | ConvertFrom-Json))) }
         catch {
             if ($i -eq $lines.Count - 1) { Write-Warning "Dropping torn final line in $path"; continue }
             throw "Damaged manifest $path at line $($i + 1)"
@@ -1178,7 +1195,54 @@ function Export-Catalog {
     Write-Host "Exported $(Format-Count $count) records to $Out"
 }
 
+function Show-Status {
+    [CmdletBinding()]
+    param(
+        [string]$Year,
+        [string]$Root = $PSScriptRoot
+    )
+
+    $Paths = Get-SotPaths $Root
+    Assert-SotRoot $Paths
+    if ($Year -and $Year -notmatch '^\d{4}$') { throw "Invalid -Year '$Year'; expected yyyy" }
+
+    $counts = @{}
+    $files = 0
+    $bytes = [long]0
+    $first = $null
+    $last = $null
+
+    foreach ($manifest in @(Get-ChildItem -LiteralPath $Paths.Library -Recurse -Filter $Script:ManifestName -File -Force)) {
+        foreach ($record in (Read-Manifest $manifest.DirectoryName)) {
+            $month = ([string]$record.date_taken).Substring(0, 7)
+            if ($Year -and -not $month.StartsWith($Year)) { continue }
+            $files++
+            $bytes += [long]$record.size
+            $key = if ($Year) { $month } else { $month.Substring(0, 4) }
+            if (-not $counts.ContainsKey($key)) { $counts[$key] = 0 }
+            $counts[$key]++
+            if (-not $first -or $month -lt $first) { $first = $month }
+            if (-not $last -or $month -gt $last) { $last = $month }
+        }
+    }
+
+    Write-Host ''
+    $label = if ($Year) { "Library $Year" } else { 'Library' }
+    Write-Host ('{0}: {1} files' -f $label, (Format-Count $files)) -ForegroundColor White
+    if ($files -gt 0) {
+        Write-Host ('Size: {0}' -f (Format-Size $bytes)) -ForegroundColor Gray
+        if (-not $Year) { Write-Host ('Span: {0} .. {1}' -f $first, $last) -ForegroundColor Gray }
+        Write-Host ''
+        foreach ($key in @($counts.Keys | Sort-Object)) {
+            Write-Host ('{0}: {1}' -f $key, (Format-Count $counts[$key])) -ForegroundColor Gray
+        }
+    }
+
+    Write-Stats $Paths
+}
+
 $Script:UsageText = [ordered]@{
+    'status'          = 'status  [-Year <yyyy>] [-Root <path>]'
     'ingest'          = 'ingest  -Inbox <folder> [-Root <path>]'
     'ingest resume'   = 'ingest  resume [-Root <path>]'
     'catalog verify'  = 'catalog verify [-Deep] [-Root <path>]'
@@ -1202,6 +1266,23 @@ function Write-Usage {
     Write-Host '-Root defaults to the script folder'
 }
 
+# array splatting binds positionally, so remaining args must become a hashtable to stay named
+function ConvertTo-ParamTable {
+    param([object[]]$Tokens)
+    $table = @{}
+    $i = 0
+    while ($i -lt $Tokens.Count) {
+        $token = "$($Tokens[$i])"
+        if (-not $token.StartsWith('-')) {
+            throw [System.Management.Automation.ParameterBindingException]::new("Unexpected argument '$token'; options must be named")
+        }
+        $next = if ($i + 1 -lt $Tokens.Count) { "$($Tokens[$i + 1])" } else { $null }
+        if ($null -eq $next -or $next.StartsWith('-')) { $table[$token.TrimStart('-')] = $true; $i++ }
+        else { $table[$token.TrimStart('-')] = $next; $i += 2 }
+    }
+    $table
+}
+
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 
 if (-not $Command) {
@@ -1210,27 +1291,35 @@ if (-not $Command) {
 }
 
 $Script:UsageKey = $null
+$Rest = $args
 try {
     switch ($Command) {
+        'status' {
+            $Script:UsageKey = 'status'
+            $subArgs = ConvertTo-ParamTable $Rest
+            Show-Status @subArgs
+        }
         'ingest' {
             if (@($Rest).Count -gt 0 -and "$($Rest[0])" -eq 'resume') {
                 $Script:UsageKey = 'ingest resume'
-                $subArgs = @(@($Rest) | Select-Object -Skip 1)
+                $subArgs = ConvertTo-ParamTable @(@($Rest) | Select-Object -Skip 1)
                 Resume-Ingest @subArgs
             }
             else {
                 $Script:UsageKey = 'ingest'
-                Import-Batch @Rest
+                $subArgs = ConvertTo-ParamTable $Rest
+                Import-Batch @subArgs
             }
         }
         'catalog' {
             $sub = if (@($Rest).Count -gt 0) { "$($Rest[0])" } else { '' }
-            $subArgs = @(@($Rest) | Select-Object -Skip 1)
+            $Script:UsageKey = "catalog $sub"
+            $subArgs = ConvertTo-ParamTable @(@($Rest) | Select-Object -Skip 1)
             switch ($sub) {
-                'verify'  { $Script:UsageKey = 'catalog verify';  Test-Catalog @subArgs }
-                'fix'     { $Script:UsageKey = 'catalog fix';     Update-Catalog @subArgs }
-                'rebuild' { $Script:UsageKey = 'catalog rebuild'; Reset-Catalog @subArgs }
-                'export'  { $Script:UsageKey = 'catalog export';  Export-Catalog @subArgs }
+                'verify'  { Test-Catalog @subArgs }
+                'fix'     { Update-Catalog @subArgs }
+                'rebuild' { Reset-Catalog @subArgs }
+                'export'  { Export-Catalog @subArgs }
                 default {
                     Write-Host "Unknown catalog command: $sub"
                     Write-Host ''
