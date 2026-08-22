@@ -216,6 +216,7 @@ $Script:ExifToolArgs = @(
     '-api', 'QuickTimeUTC=1'
     '-api', 'ImageHashType=SHA256'
     '-EXIF:DateTimeOriginal', '-EXIF:CreateDate', '-EXIF:OffsetTimeOriginal'
+    '-MakerNotes:DateTimeOriginal', '-RIFF:DateTimeOriginal'
     '-QuickTime:CreateDate'
     '-Make', '-Model', '-SerialNumber', '-BodySerialNumber'
     '-ImageWidth', '-ImageHeight', '-Duration'
@@ -338,6 +339,13 @@ function Resolve-DateTaken {
             return [pscustomobject]@{ Date = $date; Source = 'exif'; Tz = $tz }
         }
     }
+    foreach ($group in @('MakerNotes', 'RIFF')) {
+        $date = ConvertFrom-ExifDate (Get-GroupTag $Meta $group 'DateTimeOriginal')
+        if ($date -and (Test-SaneDate $date)) {
+            return [pscustomobject]@{ Date = $date; Source = $group.ToLowerInvariant(); Tz = $null }
+        }
+    }
+
     $qt = ConvertFrom-ExifDate (Get-GroupTag $Meta 'QuickTime' 'CreateDate')
     if ($qt -and (Test-SaneDate $qt)) {
         return [pscustomobject]@{ Date = $qt; Source = 'quicktime'; Tz = Get-MachineTzOffset $qt }
