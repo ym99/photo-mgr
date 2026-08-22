@@ -217,7 +217,7 @@ $Script:ExifToolArgs = @(
     '-api', 'ImageHashType=SHA256'
     '-EXIF:DateTimeOriginal', '-EXIF:CreateDate', '-EXIF:OffsetTimeOriginal'
     '-MakerNotes:DateTimeOriginal', '-RIFF:DateTimeOriginal'
-    '-QuickTime:CreateDate'
+    '-QuickTime:CreateDate', '-Matroska:DateTimeOriginal'
     '-Make', '-Model', '-SerialNumber', '-BodySerialNumber'
     '-ImageWidth', '-ImageHeight', '-Duration'
     '-ImageDataHash'
@@ -301,11 +301,12 @@ function Get-MachineTzOffset {
 }
 
 $Script:NamePatterns = @(
-    [pscustomobject]@{ Rx = [regex]'^(?:IMG|VID|PANO|PXL)[-_](\d{4})(\d{2})(\d{2})[-_](\d{2})(\d{2})(\d{2})'; DateOnly = $false }
-    [pscustomobject]@{ Rx = [regex]'^(?:IMG|VID)-(\d{4})(\d{2})(\d{2})-WA\d+'; DateOnly = $true }
-    [pscustomobject]@{ Rx = [regex]'^Screenshot[_ -](\d{4})(\d{2})(\d{2})[-_](\d{2})(\d{2})(\d{2})'; DateOnly = $false }
-    [pscustomobject]@{ Rx = [regex]'^(\d{4})-(\d{2})-(\d{2})[ _](\d{2})[.\-](\d{2})[.\-](\d{2})'; DateOnly = $false }
-    [pscustomobject]@{ Rx = [regex]'^(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})(?:[_.]|$)'; DateOnly = $false }
+    [pscustomobject]@{ Rx = [regex]'(?i)^(?:IMG|VID|PANO|PXL)[-_](\d{4})(\d{2})(\d{2})[-_](\d{2})(\d{2})(\d{2})'; DateOnly = $false }
+    [pscustomobject]@{ Rx = [regex]'(?i)^(?:IMG|VID)-(\d{4})(\d{2})(\d{2})-WA\d+'; DateOnly = $true }
+    [pscustomobject]@{ Rx = [regex]'(?i)^Screenshot[_ -](\d{4})(\d{2})(\d{2})[-_](\d{2})(\d{2})(\d{2})'; DateOnly = $false }
+    [pscustomobject]@{ Rx = [regex]'(?i)^video-(\d{4})-(\d{2})-(\d{2})-(\d{2})-(\d{2})-(\d{2})'; DateOnly = $false }
+    [pscustomobject]@{ Rx = [regex]'(?i)^(\d{4})-(\d{2})-(\d{2})[ _](\d{2})[.\-](\d{2})[.\-](\d{2})'; DateOnly = $false }
+    [pscustomobject]@{ Rx = [regex]'(?i)^(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})(?:[_.]|$)'; DateOnly = $false }
 )
 
 function Resolve-NameDate {
@@ -350,6 +351,14 @@ function Resolve-DateTaken {
     if ($qt -and (Test-SaneDate $qt)) {
         return [pscustomobject]@{ Date = $qt; Source = 'quicktime'; Tz = Get-MachineTzOffset $qt }
     }
+    # Matroska stamps UTC (trailing Z); QuickTime is pre-localized by the QuickTimeUTC api flag
+    $mkvRaw = Get-GroupTag $Meta 'Matroska' 'DateTimeOriginal'
+    $mkv = ConvertFrom-ExifDate $mkvRaw
+    if ($mkv -and "$mkvRaw" -match 'Z\s*$') { $mkv = [datetime]::SpecifyKind($mkv, 'Utc').ToLocalTime() }
+    if ($mkv -and (Test-SaneDate $mkv)) {
+        return [pscustomobject]@{ Date = $mkv; Source = 'matroska'; Tz = Get-MachineTzOffset $mkv }
+    }
+
     $named = Resolve-NameDate $FileName
     if ($named) {
         return [pscustomobject]@{ Date = $named; Source = 'filename'; Tz = $null }
@@ -888,7 +897,7 @@ function Test-Catalog {
             }
             $actual.Remove([string]$record.name)
             if (-not $file.IsReadOnly) {
-                $findings.Add([pscustomobject]@{ issue = 'not-readonly'; folder = $folder; name = $record.name; detail = 'run update to restore' })
+                $findings.Add([pscustomobject]@{ issue = 'not-readonly'; folder = $folder; name = $record.name; detail = 'run catalog fix to restore' })
             }
             if ($file.Length -ne $record.size) {
                 $issue = if ($file.Length -eq 0) { 'zeroed' } else { 'size-mismatch' }
@@ -908,7 +917,7 @@ function Test-Catalog {
         }
 
         foreach ($name in $actual.Keys) {
-            $findings.Add([pscustomobject]@{ issue = 'orphan'; folder = $folder; name = $name; detail = 'file has no catalog record; run update' })
+            $findings.Add([pscustomobject]@{ issue = 'orphan'; folder = $folder; name = $name; detail = 'file has no catalog record; run catalog fix' })
         }
 
         if ($Deep -and $changed) { Write-Manifest $folder $records }
