@@ -8,7 +8,9 @@ $ErrorActionPreference = 'Stop'
 $Script:Schema       = 1
 $Script:ManifestName = '.catalog.jsonl'
 $Script:TwinMarker   = '--library--'
+$Script:TwinLinkExt  = '.lnk'
 $Script:TwinMaxLen   = 180
+$Script:Shell        = $null
 $Script:Utf8NoBom    = [System.Text.UTF8Encoding]::new($false)
 $Script:MinYear      = 1990
 $Script:ExifTool     = $null
@@ -499,26 +501,29 @@ function Resolve-GroupBaseName {
     throw "No free name for $BaseName in $DestDir"
 }
 
-function Copy-LibraryTwin {
+function New-LibraryTwin {
     param([string]$SuspectFinalPath, [string]$LibraryFile)
     if (-not (Test-Path -LiteralPath $LibraryFile)) { return }
     $dir = Split-Path -Parent $SuspectFinalPath
     $suspectLeaf = Split-Path -Leaf $SuspectFinalPath
     $libLeaf = Split-Path -Leaf $LibraryFile
     $ext = [System.IO.Path]::GetExtension($libLeaf)
-    $name = $suspectLeaf + $Script:TwinMarker + $libLeaf
-    if ($name.Length -gt $Script:TwinMaxLen) {
-        $tailBudget = $Script:TwinMaxLen - $suspectLeaf.Length - $Script:TwinMarker.Length - $ext.Length
+    # shortcuts go through COM, which is not long-path aware: keep the whole path inside MAX_PATH
+    $maxName = [Math]::Min($Script:TwinMaxLen, 258 - $dir.Length)
+    $name = $suspectLeaf + $Script:TwinMarker + $libLeaf + $Script:TwinLinkExt
+    if ($name.Length -gt $maxName) {
+        $tailBudget = $maxName - $suspectLeaf.Length - $Script:TwinMarker.Length - $ext.Length - $Script:TwinLinkExt.Length
         $libBase = [System.IO.Path]::GetFileNameWithoutExtension($libLeaf)
-        if ($tailBudget -lt 1) { $name = $suspectLeaf + $Script:TwinMarker + 'x' + $ext }
-        else { $name = $suspectLeaf + $Script:TwinMarker + $libBase.Substring(0, [Math]::Min($libBase.Length, $tailBudget)) + $ext }
+        if ($tailBudget -lt 1) { $name = $suspectLeaf + $Script:TwinMarker + 'x' + $ext + $Script:TwinLinkExt }
+        else { $name = $suspectLeaf + $Script:TwinMarker + $libBase.Substring(0, [Math]::Min($libBase.Length, $tailBudget)) + $ext + $Script:TwinLinkExt }
     }
     $dest = Join-Path $dir $name
     if (Test-Path -LiteralPath $dest) { return }
-    Copy-Item -LiteralPath $LibraryFile -Destination $dest
-    Set-FileReadOnly $dest $false
+    if ($null -eq $Script:Shell) { $Script:Shell = New-Object -ComObject WScript.Shell }
+    $link = $Script:Shell.CreateShortcut($dest)
+    $link.TargetPath = $LibraryFile
+    $link.Save()
 }
-
 function Get-LibraryGroupFiles {
     param([string]$LibraryFilePath)
     $folder = Split-Path -Parent $LibraryFilePath
@@ -645,7 +650,10 @@ function Invoke-GroupIngest {
         $bucket = if ($pixelOnly) { $Paths.CompletePixels } else { $Paths.CompleteBytes }
         $statKey = if ($pixelOnly) { 'complete-copy--same-pixels' } else { 'complete-copy--same-bytes' }
         foreach ($m in $members) {
-            Move-FileSafe -Source $m.FullName -Dest (Join-Path $bucket $m.Name) | Out-Null
+            $moved = Move-FileSafe -Source $m.FullName -Dest (Join-Path $bucket $m.Name)
+            if ($matchTarget.ContainsKey($m.FullName) -and $matchTarget[$m.FullName]) {
+                New-LibraryTwin $moved $matchTarget[$m.FullName]
+            }
         }
         $Stats[$statKey]++
         return
@@ -655,7 +663,7 @@ function Invoke-GroupIngest {
         foreach ($m in $members) {
             $moved = Move-FileSafe -Source $m.FullName -Dest (Join-Path $Paths.PartialCopy $m.Name)
             if ($matchTarget.ContainsKey($m.FullName) -and $matchTarget[$m.FullName]) {
-                Copy-LibraryTwin $moved $matchTarget[$m.FullName]
+                New-LibraryTwin $moved $matchTarget[$m.FullName]
             }
         }
         Confirm-KeepFolder $Paths
@@ -696,7 +704,7 @@ function Invoke-GroupIngest {
                 else {
                     $counterpart = $libGroup | Where-Object { $_.Role -eq 'companion' -and $_.Ext -ieq $m.Extension } | Select-Object -First 1
                 }
-                if ($counterpart) { Copy-LibraryTwin $moved $counterpart.Path }
+                if ($counterpart) { New-LibraryTwin $moved $counterpart.Path }
             }
             Confirm-KeepFolder $Paths
             $Stats['suspected-copy']++
