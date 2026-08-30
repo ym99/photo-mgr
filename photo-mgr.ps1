@@ -19,7 +19,7 @@ $Script:RawExts        = @('.nef', '.cr2', '.cr3', '.crw', '.arw', '.dng', '.orf
 $Script:HeicExts       = @('.heic', '.heif')
 $Script:JpegExts       = @('.jpg', '.jpeg')
 $Script:VideoExts      = @('.mov', '.qt', '.mp4', '.m4v', '.avi', '.mts', '.m2ts', '.3gp', '.wmv', '.mkv', '.mpg', '.mpeg')
-$Script:OtherImageExts = @('.png', '.gif', '.bmp', '.tif', '.tiff', '.webp')
+$Script:OtherImageExts = @('.png', '.gif', '.bmp', '.tif', '.tiff', '.webp', '.psd')
 $Script:SidecarExts    = @('.xmp', '.aae', '.thm')
 $Script:JunkNames      = @('thumbs.db', 'desktop.ini', '.ds_store')
 
