@@ -307,6 +307,7 @@ $Script:NamePatterns = @(
     [pscustomobject]@{ Rx = [regex]'(?i)^(?:IMG|VID)-(\d{4})(\d{2})(\d{2})-WA\d+'; DateOnly = $true }
     [pscustomobject]@{ Rx = [regex]'(?i)^Screenshot[_ -](\d{4})(\d{2})(\d{2})[-_](\d{2})(\d{2})(\d{2})'; DateOnly = $false }
     [pscustomobject]@{ Rx = [regex]'(?i)^video-(\d{4})-(\d{2})-(\d{2})-(\d{2})-(\d{2})-(\d{2})'; DateOnly = $false }
+    [pscustomobject]@{ Rx = [regex]'(?i)^Burst_Cover_GIF_Action_(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})'; DateOnly = $false }
     [pscustomobject]@{ Rx = [regex]'(?i)^(\d{4})-(\d{2})-(\d{2})[ _](\d{2})[.\-](\d{2})[.\-](\d{2})'; DateOnly = $false }
     [pscustomobject]@{ Rx = [regex]'(?i)^(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})(?:[_.]|$)'; DateOnly = $false }
 )
