@@ -10,7 +10,6 @@ $Script:ManifestName = '.catalog.jsonl'
 $Script:TwinMarker   = '--library--'
 $Script:TwinLinkExt  = '.lnk'
 $Script:TwinMaxLen   = 180
-$Script:Shell        = $null
 $Script:Utf8NoBom    = [System.Text.UTF8Encoding]::new($false)
 $Script:MinYear      = 1990
 $Script:ExifTool     = $null
@@ -502,6 +501,64 @@ function Resolve-GroupBaseName {
     throw "No free name for $BaseName in $DestDir"
 }
 
+# WScript.Shell is ANSI-only and throws on non-ASCII targets; IShellLinkW is the Unicode path
+$Script:ShellLinkSource = @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace PhotoMgr {
+    [ComImport, Guid("00021401-0000-0000-C000-000000000046")]
+    internal class ShellLink { }
+
+    [ComImport, Guid("000214F9-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IShellLinkW {
+        void GetPath([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszFile, int cch, IntPtr pfd, uint fFlags);
+        void GetIDList(out IntPtr ppidl);
+        void SetIDList(IntPtr pidl);
+        void GetDescription([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszName, int cch);
+        void SetDescription([MarshalAs(UnmanagedType.LPWStr)] string pszName);
+        void GetWorkingDirectory([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszDir, int cch);
+        void SetWorkingDirectory([MarshalAs(UnmanagedType.LPWStr)] string pszDir);
+        void GetArguments([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszArgs, int cch);
+        void SetArguments([MarshalAs(UnmanagedType.LPWStr)] string pszArgs);
+        void GetHotkey(out short pwHotkey);
+        void SetHotkey(short wHotkey);
+        void GetShowCmd(out int piShowCmd);
+        void SetShowCmd(int iShowCmd);
+        void GetIconLocation([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszIconPath, int cch, out int piIcon);
+        void SetIconLocation([MarshalAs(UnmanagedType.LPWStr)] string pszIconPath, int iIcon);
+        void SetRelativePath([MarshalAs(UnmanagedType.LPWStr)] string pszPathRel, uint dwReserved);
+        void Resolve(IntPtr hwnd, uint fFlags);
+        void SetPath([MarshalAs(UnmanagedType.LPWStr)] string pszFile);
+    }
+
+    [ComImport, Guid("0000010b-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IPersistFile {
+        void GetClassID(out Guid pClassID);
+        [PreserveSig] int IsDirty();
+        void Load([MarshalAs(UnmanagedType.LPWStr)] string pszFileName, uint dwMode);
+        void Save([MarshalAs(UnmanagedType.LPWStr)] string pszFileName, [MarshalAs(UnmanagedType.Bool)] bool fRemember);
+        void SaveCompleted([MarshalAs(UnmanagedType.LPWStr)] string pszFileName);
+        void GetCurFile([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder ppszFileName);
+    }
+
+    public static class Shortcut {
+        public static void Create(string linkPath, string targetPath) {
+            IShellLinkW link = (IShellLinkW)new ShellLink();
+            link.SetPath(targetPath);
+            ((IPersistFile)link).Save(linkPath, true);
+        }
+    }
+}
+'@
+
+function New-Shortcut {
+    param([string]$LinkPath, [string]$TargetPath)
+    if (-not ('PhotoMgr.Shortcut' -as [type])) { Add-Type -TypeDefinition $Script:ShellLinkSource }
+    [PhotoMgr.Shortcut]::Create($LinkPath, $TargetPath)
+}
+
 function New-LibraryTwin {
     param([string]$SuspectFinalPath, [string]$LibraryFile)
     if (-not (Test-Path -LiteralPath $LibraryFile)) { return }
@@ -520,10 +577,7 @@ function New-LibraryTwin {
     }
     $dest = Join-Path $dir $name
     if (Test-Path -LiteralPath $dest) { return }
-    if ($null -eq $Script:Shell) { $Script:Shell = New-Object -ComObject WScript.Shell }
-    $link = $Script:Shell.CreateShortcut($dest)
-    $link.TargetPath = $LibraryFile
-    $link.Save()
+    New-Shortcut $dest $LibraryFile
 }
 function Get-LibraryGroupFiles {
     param([string]$LibraryFilePath)
