@@ -1344,6 +1344,9 @@ function Write-Usage {
     Write-Host ''
     Write-Host "ingest resume applies your finished work: _must-decide\keep and newly dated _must-provide files"
     Write-Host '-Root defaults to the script folder'
+    Write-Host ''
+    Write-Host 'backup (not part of this tool) - mirror the library to the NAS:' -ForegroundColor Magenta
+    Write-Host '  robocopy W:\PhotoLib Z:\PhotoLib /MIR /COPY:DAT /DCOPY:T /FFT /DST /XJ /R:2 /W:5 /MT:8 /NP' -ForegroundColor Magenta
 }
 
 # array splatting binds positionally, so remaining args must become a hashtable to stay named
